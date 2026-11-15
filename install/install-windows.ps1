@@ -49,7 +49,8 @@ Run ("Create venv in " + $AppDir) { New-Item -ItemType Directory -Force $AppDir 
 Run 'Install 2FastAPI and libcst / 2FastAPI と libcst を導入' {
     $vpy = Join-Path $AppDir 'venv\Scripts\python.exe'
     & $vpy -m pip install --quiet --upgrade pip
-    & $vpy -m pip install --quiet $Src
+    & $vpy -m pip install --quiet libcst
+    & $vpy -m pip install --quiet --force-reinstall --no-deps $Src
 }
 
 # 3. open-easy-web: install when missing (default on)
