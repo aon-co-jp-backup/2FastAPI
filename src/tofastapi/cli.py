@@ -4,6 +4,7 @@
 2fastapi django project_dir -o out_dir
 2fastapi scan DIR [--json]            list Flask / Django projects found below DIR
 2fastapi auto DIR [-o OUT] [--yes]    scan, ask (English / Japanese) what and where to convert, convert
+2fastapi gui | web                   graphical wizard (folder pickers, 13 languages) / the same in the browser (local only)
 2fastapi convert --kind flask|django --path P -o OUT   (used by the VS Code extension)
 """
 from __future__ import annotations
@@ -39,9 +40,24 @@ def main(argv=None) -> int:
     c.add_argument("--path", required=True)
     c.add_argument("-o", "--output", required=True)
     c.add_argument("--json", action="store_true")
+    c.add_argument("--target", choices=["fastapi", "mfastapi"], default="fastapi", help="mfastapi also writes run_mfastapi.py and requirements.txt")
+    w = sub.add_parser("web", help="open the browser wizard (served on this PC only)")
+    w.add_argument("--no-browser", action="store_true")
+    w.add_argument("--port", type=int, default=0)
+    g = sub.add_parser("gui", help="open the graphical wizard (folder pickers, 13 languages)")
+    g.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    g.add_argument("--install-shortcut", action="store_true", help="create a desktop shortcut with an icon (Windows)")
     ns = ap.parse_args(argv)
 
     cmd = ns.cmd
+    if cmd == "web":
+        from .web import serve
+
+        return serve(open_browser=not ns.no_browser, port=ns.port)
+    if cmd == "gui":
+        from .gui import main as gui_main
+
+        return gui_main(selftest=ns.selftest, install_shortcut=ns.install_shortcut)
     if cmd == "scan":
         from .scan import scan
 
@@ -66,7 +82,7 @@ def main(argv=None) -> int:
                 p.files = [os.path.relpath(os.path.join(dp, fn), p.path) for dp, _, fns in os.walk(p.path) for fn in fns if fn.endswith(".py")]
                 p.entry = p.files[0] if p.files else ""
             projects = [p]
-        routes, warns = convert_project_to(projects[0], ns.output)
+        routes, warns = convert_project_to(projects[0], ns.output, ns.target)
         if ns.json:
             print(json.dumps({"routes": routes, "warnings": warns, "dest": os.path.abspath(ns.output)}, ensure_ascii=False))
         else:

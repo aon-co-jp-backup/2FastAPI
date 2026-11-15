@@ -131,8 +131,21 @@ def _count_routes_django(d: str) -> int:
 
 # ---------------------------------------------------------------- conversion
 
-def convert_project_to(p: Project, out_dir: str):
-    """Convert one scanned project into `out_dir` (created if needed). Returns (routes, warnings)."""
+def convert_project_to(p: Project, out_dir: str, target: str = "fastapi"):
+    """Convert one scanned project into `out_dir` (created if needed). Returns (routes, warnings).
+
+    target="mfastapi" additionally writes run_mfastapi.py (mfastapi.accelerate(app)) and requirements.txt.
+    """
+    routes, warns = _convert_project_to(p, out_dir)
+    if target == "mfastapi":
+        apply_mfastapi(p, out_dir)
+    return routes, warns
+
+
+from .mfastapi_target import apply_mfastapi  # noqa: E402
+
+
+def _convert_project_to(p: Project, out_dir: str):
     os.makedirs(out_dir, exist_ok=True)
     if p.kind == "django":
         from .django_conv import convert_project

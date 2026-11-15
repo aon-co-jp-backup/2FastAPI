@@ -18,5 +18,11 @@ test = ["pytest", "flask", "django", "fastapi", "httpx", "python-multipart", "fl
 "2fastapi" = "tofastapi.cli:main"
 tofastapi = "tofastapi.cli:main"
 
+[project.gui-scripts]
+"2fastapi-gui" = "tofastapi.gui:main"
+
+[tool.setuptools.package-data]
+tofastapi = ["2fastapi.ico"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
