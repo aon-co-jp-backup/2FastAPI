@@ -1,5 +1,6 @@
 import json
 
+from django.views import View
 from django.http import HttpResponse, HttpResponseRedirect, Http404, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
@@ -49,3 +50,28 @@ def agent(request):
 
 def archive(request, year):
     return JsonResponse({"archive": year})
+
+
+NOTES = {1: "first", 2: "second"}
+
+
+class Notes(View):
+    def get(self, request):
+        limit = int(request.GET.get("limit", "10"))
+        return JsonResponse({"notes": list(NOTES.values())[:limit]})
+
+    def post(self, request):
+        text = request.POST.get("text")
+        if not text:
+            return JsonResponse({"error": "text required"}, status=400)
+        return JsonResponse({"created": text}, status=201)
+
+
+class NoteDetail(View):
+    def get(self, request, pk):
+        if pk not in NOTES:
+            raise Http404
+        return JsonResponse({"id": pk, "text": NOTES[pk]})
+
+    def delete(self, request, pk):
+        return JsonResponse({"deleted": pk})

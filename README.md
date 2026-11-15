@@ -42,9 +42,10 @@ uvicorn main:app --reload
 | `raise Http404 / PermissionDenied` | `HTTPException` |
 | `@require_GET/POST/http_methods`, `request.method == "POST"` | ルートの HTTP メソッド / route methods |
 | `@csrf_exempt` 等 | 削除 / dropped |
+| `View` サブクラス + `as_view()` (`get`/`post`/`put`/`patch`/`delete`) | メソッドごとのルート関数 `Class_get` ... / one route function per method |
 
 ## 変換しないもの(警告で報告) / Not converted (reported)
-ORM(Django models / Flask-SQLAlchemy)、Djangoのテンプレート(`render`)、セッション/認証(`session`, `flask_login`, `login_required`)、Djangoのクラスベースビュー/DRF、`teardown_request`、`flask.g`、各種 Flask 拡張(`flask_restful`, `flask_jwt_extended` など、手順を警告に表示)。
+ORM(Django models / Flask-SQLAlchemy)、Djangoのテンプレート(`render`)、セッション/認証(`session`, `flask_login`, `login_required`)、Django の `View` 以外のクラスベースビュー(`TemplateView` 等)・DRF、`teardown_request`、`flask.g`、各種 Flask 拡張(`flask_restful`, `flask_jwt_extended` など、手順を警告に表示)。
 
 ## 互換性の注意 / Behaviour differences (documented, tested)
 - 検証エラー: FastAPI は **422**(Flask/Django の手書き検証や型変換失敗は 400/404)。`<int:id>` に数字以外が来たとき Flask は 404、FastAPI は 422。

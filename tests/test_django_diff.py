@@ -28,6 +28,14 @@ REQUESTS = [
     ["GET", "/agent/", {"headers": {"X-Agent": "pytest"}}],
     ["GET", "/agent/", {}],
     ["GET", "/archive/2023/", {}],
+    ["GET", "/notes/", {}],
+    ["GET", "/notes/?limit=1", {}],
+    ["POST", "/notes/", {"data": {"text": "hi"}}],
+    ["POST", "/notes/", {"data": {}}],
+    ["GET", "/notes/1/", {}],
+    ["GET", "/notes/7/", {}],
+    ["DELETE", "/notes/2/", {}],
+    ["PUT", "/notes/", {}],
 ]
 
 
@@ -50,8 +58,10 @@ def django_results():
         data = kw.pop("data", None)
         if method == "GET":
             r = c.get(url, **extra)
-        else:
+        elif method == "POST":
             r = c.post(url, data=data or {}, **extra)
+        else:
+            r = c.generic(method, url, **extra)
         ct = r.headers.get("Content-Type", "")
         body = json.loads(r.content) if "json" in ct else r.content.decode()
         out.append([r.status_code, body, r.headers.get("Location")])
@@ -82,6 +92,6 @@ def test_same_responses(converted):
 
 def test_routes_and_output(converted):
     res, _, out = converted
-    assert res.routes == 18  # 9 views x 2 prefixes
+    assert res.routes == 26  # (9 functions + 4 class handlers) x 2 prefixes
     assert os.path.isfile(os.path.join(out, "main.py"))
     assert "uvicorn main:app" in open(os.path.join(out, "CONVERSION_REPORT.md")).read()

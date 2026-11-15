@@ -30,6 +30,9 @@ DROP_DECORATORS = {"csrf_exempt", "never_cache", "csrf_protect", "ensure_csrf_co
 METHOD_DECORATORS = {"require_GET": ["GET"], "require_POST": ["POST"], "require_safe": ["GET", "HEAD"], "require_http_methods": None}
 
 
+HTTP_METHODS = ("get", "post", "put", "patch", "delete", "head")
+
+
 class DjangoRewriter(BodyRewriter):
     def __init__(self, notes: List[str]):
         super().__init__(notes)
@@ -178,6 +181,7 @@ class ViewsConverter(cst.CSTTransformer):
         self.typing: Set[str] = set()
         self.need_uuid = False
         self.count = 0
+        self.depth = 0
 
     def _line(self, node) -> int:
         try:
@@ -204,24 +208,58 @@ class ViewsConverter(cst.CSTTransformer):
             self.warn(original, "django-api", "`%s` is Django-specific and not converted" % mod)
         return updated
 
+    def visit_ClassDef(self, node):
+        self.depth += 1
+
     def leave_ClassDef(self, original, updated):
-        for b in updated.bases:
-            n = dotted(b.value) or ""
-            if n.endswith(("View", "ViewSet", "APIView", "Model", "Form", "ModelForm", "Serializer")):
-                self.warn(original, "class-view", "class `%s(%s)` is not converted" % (original.name.value, n))
+        self.depth -= 1
+        cname = original.name.value
+        bases = [dotted(b.value) or "" for b in updated.bases]
+        plain_view = any(b.split(".")[-1] == "View" and not b.startswith("rest_framework") for b in bases)
+        if plain_view and cname in self.routes:
+            funcs = []
+            for st in updated.body.body:
+                if not isinstance(st, cst.FunctionDef):
+                    if isinstance(st, cst.SimpleStatementLine) and st.body and isinstance(st.body[0], cst.Assign):
+                        self.warn(st, "class-view", "class attribute in %s is not converted: inline it where used" % cname)
+                    continue
+                m = st.name.value
+                if m in HTTP_METHODS:
+                    fn = st.with_changes(name=cst.Name("%s_%s" % (cname, m)), leading_lines=[cst.EmptyLine(), cst.EmptyLine()])
+                    conv = self._convert(st, fn, cname, [m.upper()], True)
+                    if count_name(conv.body, "self") > 0:
+                        self.warn(st, "class-view", "%s.%s uses `self`: check the converted function" % (cname, m))
+                    funcs.append(conv)
+                elif m in ("dispatch", "setup", "get_context_data", "options"):
+                    self.warn(st, "class-view", "%s.%s is not converted" % (cname, m))
+                else:
+                    self.warn(st, "class-view", "helper method %s.%s was dropped: move it to a module-level function" % (cname, m))
+            if not funcs:
+                self.warn(original, "class-view", "class %s has no HTTP method handlers" % cname)
+                return updated
+            self.warn(original, "class-view", "class %s converted to one route function per HTTP method (%s)" % (cname, ", ".join(f.name.value for f in funcs)))
+            return cst.FlattenSentinel(funcs)
+        for b in bases:
+            if b.endswith(("View", "ViewSet", "APIView", "Model", "Form", "ModelForm", "Serializer")):
+                self.warn(original, "class-view", "class `%s(%s)` is not converted" % (cname, b))
         return updated
 
     def leave_FunctionDef(self, original, updated):
         name = original.name.value
-        if name not in self.routes:
+        if self.depth or name not in self.routes:
             return updated
-        methods: Optional[List[str]] = None
+        return self._convert(original, updated, name, None, False)
+
+    def _convert(self, original, updated, name, methods, drop_self):
         others = []
         for dec in updated.decorators:
             c = dec.decorator
             dn = dotted(c.func) if isinstance(c, cst.Call) else dotted(c)
             dn = (dn or "").split(".")[-1]
             if dn in DROP_DECORATORS:
+                continue
+            if dn in ("method_decorator",):
+                self.warn(original, "auth", "@method_decorator on %s is not converted" % name)
                 continue
             if dn in METHOD_DECORATORS:
                 if METHOD_DECORATORS[dn] is not None:
@@ -240,6 +278,8 @@ class ViewsConverter(cst.CSTTransformer):
             methods = sorted(seen | {"GET"}) if seen else ["GET"]
         # parameters: drop the request argument when it is no longer used
         params = list(updated.params.params)
+        if drop_self and params:
+            params = params[1:]
         req_name = params[0].name.value if params else None
         keep_request = False
         if req_name:
@@ -266,6 +306,7 @@ class ViewsConverter(cst.CSTTransformer):
             self.fastapi.add("Request")
             newp.append(make_param("request", "Request", None))
         decs = []
+        fname = updated.name.value
         for path, _ in self.routes[name]:
             if len(methods) == 1:
                 src = "router.%s(%r)" % (methods[0].lower(), path)
@@ -460,7 +501,14 @@ def collect_routes(root: str, urls_file: str, prefix: str = "", seen=None, warns
             for vf, fns in sub.items():
                 for fn, rl in fns.items():
                     out.setdefault(vf, {}).setdefault(fn, []).extend(rl)
-        elif kind != "cbv" and view[0] == "view":
+        elif view[0] == "cbv":
+            r = _resolve(urls_file, root, imports, view[1])
+            if r is None:
+                warns.append(Warn(0, "view", "class view %r could not be resolved" % view[1]))
+                continue
+            f, fn = r
+            out.setdefault(f, {}).setdefault(fn, []).append((_join(prefix, conv), params))
+        elif view[0] == "view":
             r = _resolve(urls_file, root, imports, view[1])
             if r is None:
                 warns.append(Warn(0, "view", "view %r could not be resolved" % view[1]))
@@ -520,7 +568,7 @@ def convert_project(project: str, out_dir: str) -> Result:
             warns.append(Warn(w.line, w.code, "%s: %s" % (rel, w.msg)))
         total += conv.count
         modules.append(rel[:-3].replace(os.sep, "."))
-        missing = [fn for fn in fns if not re.search(r"def\s+%s\s*\(" % re.escape(fn), src)]
+        missing = [fn for fn in fns if not re.search(r"(def|class)\s+%s\b" % re.escape(fn), src)]
         for fn in missing:
             warns.append(Warn(0, "view", "%s: view function %s not found (class-based view?)" % (rel, fn)))
     lines = ["from fastapi import FastAPI", ""]
