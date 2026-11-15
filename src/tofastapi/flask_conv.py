@@ -120,7 +120,15 @@ class BodyRewriter(cst.CSTTransformer):
         dflt = _code(default_node) if default_node is not None else None
         if ann is None:
             ann = "str"  # request values are strings unless type= is given (keeps Flask/Django semantics)
-        if kind == "query":
+        if kind == "body":
+            self.fastapi.add("Body")
+            self.typing.add("Any")
+            if required:
+                self.params.add(name, "Any", "Body(..., embed=True)")
+            else:
+                self.typing.add("Optional")
+                self.params.add(name, "Optional[Any]", "Body(%s, embed=True)" % (dflt if dflt is not None else "None"))
+        elif kind == "query":
             if required:
                 self.params.add(name, ann or "str", None)
             elif dflt is None:

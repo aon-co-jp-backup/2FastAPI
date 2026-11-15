@@ -17,6 +17,8 @@ REQUEST_KINDS = {
     "request.COOKIES": "cookie",
     "request.headers": "header",
     "request.META": "meta",
+    "request.query_params": "query",
+    "request.data": "body",
 }
 SHORTCUT_STATUS = {
     "HttpResponseNotFound": 404,
@@ -27,7 +29,17 @@ SHORTCUT_STATUS = {
 }
 RAISE_STATUS = {"Http404": 404, "PermissionDenied": 403, "SuspiciousOperation": 400}
 DROP_DECORATORS = {"csrf_exempt", "never_cache", "csrf_protect", "ensure_csrf_cookie", "cache_page", "vary_on_headers", "xframe_options_exempt"}
-METHOD_DECORATORS = {"require_GET": ["GET"], "require_POST": ["POST"], "require_safe": ["GET", "HEAD"], "require_http_methods": None}
+DRF_DROP_DECORATORS = {"renderer_classes", "parser_classes", "throttle_classes"}
+DRF_AUTH_DECORATORS = {"permission_classes", "authentication_classes"}
+DRF_FIELD_TYPES = {
+    "CharField": "str", "EmailField": "str", "URLField": "str", "SlugField": "str", "RegexField": "str", "ChoiceField": "str",
+    "IntegerField": "int", "FloatField": "float", "DecimalField": "float", "BooleanField": "bool",
+    "UUIDField": "uuid.UUID", "DateTimeField": "datetime.datetime", "DateField": "datetime.date", "TimeField": "datetime.time",
+    "ListField": "list", "DictField": "dict", "JSONField": "Any",
+}
+DRF_REMOVE_MODULES = {"rest_framework.response", "rest_framework.decorators", "rest_framework.status", "rest_framework.views", "rest_framework.serializers", "rest_framework.permissions", "rest_framework.authentication", "rest_framework.renderers", "rest_framework.parsers", "rest_framework.throttling"}
+DRF_REMOVE_NAMES = {"status", "serializers", "views", "response", "decorators"}
+METHOD_DECORATORS = {"api_view": None, "require_GET": ["GET"], "require_POST": ["POST"], "require_safe": ["GET", "HEAD"], "require_http_methods": None}
 
 
 HTTP_METHODS = ("get", "post", "put", "patch", "delete", "head")
@@ -37,6 +49,8 @@ class DjangoRewriter(BodyRewriter):
     def __init__(self, notes: List[str]):
         super().__init__(notes)
         self.methods_seen: Set[str] = set()
+        self.serializers: Set[str] = set()
+        self.serial_vars: Set[str] = set()
 
     def _kind_param(self, base: str, key: str, default, type_node, required: bool):
         kind = REQUEST_KINDS[base]
@@ -70,16 +84,26 @@ class DjangoRewriter(BodyRewriter):
                 return updated
             default = pos[1].value if len(pos) > 1 else _kw(args, "default")
             return self._kind_param(base, key, default, None, False)
-        if base in ("request.GET", "request.POST") and last == "getlist" and pos and str_value(pos[0].value):
+        if base in ("request.GET", "request.POST", "request.query_params") and last == "getlist" and pos and str_value(pos[0].value):
             name = ident(str_value(pos[0].value))
             self.typing.add("List")
-            if base == "request.GET":
+            if base in ("request.GET", "request.query_params"):
                 self.fastapi.add("Query")
                 self.params.add(name, "List[str]", "Query(default=[])")
             else:
                 self.fastapi.add("Form")
                 self.params.add(name, "List[str]", "Form(default=[])")
             return cst.Name(name)
+        if base in self.serial_vars and last == "is_valid":
+            return cst.Name("True")
+        if d == "Response":
+            data = pos[0].value if pos else _kw(args, "data")
+            status = _kw(args, "status")
+            if data is None:
+                self.fastapi.add("Response")
+                return cst.parse_expression("Response(status_code=%s)" % (_code(status) if status is not None else "200"))
+            self.responses.add("JSONResponse")
+            return cst.parse_expression("JSONResponse(content=%s, status_code=%s)" % (_code(data), _code(status) if status is not None else "200"))
         if d == "JsonResponse" and pos:
             self.responses.add("JSONResponse")
             status = _kw(args, "status")
@@ -127,6 +151,14 @@ class DjangoRewriter(BodyRewriter):
 
     def leave_Attribute(self, original, updated):
         d = dotted(updated)
+        m = re.match(r"^status\.HTTP_(\d\d\d)_", d or "")
+        if m:
+            return cst.Integer(m.group(1))
+        base, _, last = (d or "").rpartition(".")
+        if base in self.serial_vars and last in ("validated_data", "data"):
+            return cst.parse_expression("%s.model_dump(exclude_none=True)" % base)
+        if base in self.serial_vars and last == "errors":
+            self.notes.append("serializer errors: FastAPI answers invalid input with 422 automatically (DRF used 400)")
         if d == "request.path":
             return cst.parse_expression("request.url.path")
         if d in ("request.user", "request.session", "request.FILES", "request.body"):
@@ -151,6 +183,16 @@ class DjangoRewriter(BodyRewriter):
     def leave_SimpleStatementLine(self, original, updated):
         if len(updated.body) == 1 and isinstance(updated.body[0], cst.Assign):
             a = updated.body[0]
+            # ser = XSerializer(data=request.data)  ->  body parameter `ser: X`
+            if len(a.targets) == 1 and isinstance(a.targets[0].target, cst.Name) and isinstance(a.value, cst.Call):
+                fn = dotted(a.value.func)
+                dv = _kw(list(a.value.args), "data")
+                if fn in self.serializers and dv is not None and dotted(dv) == "request.data":
+                    var = a.targets[0].target.value
+                    self.fastapi.add("Body")
+                    self.params.add(var, fn, "Body(...)")
+                    self.serial_vars.add(var)
+                    return cst.RemoveFromParent()
             if len(a.targets) == 1 and isinstance(a.targets[0].target, cst.Name) and isinstance(a.value, cst.Name) and a.value.value == a.targets[0].target.value:
                 return cst.RemoveFromParent()
         return updated
@@ -159,6 +201,13 @@ class DjangoRewriter(BodyRewriter):
         if self.depth > 0 or updated.value is None:
             return updated
         ov = original.value
+        # `return Response(data)` (DRF, no status) -> `return data`
+        if isinstance(ov, cst.Call) and dotted(ov.func) == "Response":
+            oargs = list(ov.args)
+            if len(oargs) == 1 and oargs[0].keyword is None:
+                call = updated.value
+                if isinstance(call, cst.Call) and call.args:
+                    return updated.with_changes(value=call.args[0].value)
         # `return JsonResponse(data)` (no status/headers) -> `return data`
         if isinstance(ov, cst.Call) and dotted(ov.func) == "JsonResponse":
             oargs = list(ov.args)
@@ -183,6 +232,70 @@ class ViewsConverter(cst.CSTTransformer):
         self.count = 0
         self.depth = 0
         self.need_templates = False
+        self.serializers: Set[str] = set()
+        self.need_pydantic = False
+        self.need_datetime = False
+        self.need_field = False
+
+    def visit_Module(self, node):
+        for st in node.body:
+            if isinstance(st, cst.ClassDef) and self._is_plain_serializer(st):
+                self.serializers.add(st.name.value)
+        return True
+
+    @staticmethod
+    def _is_plain_serializer(c):
+        bs = [dotted(b.value) or "" for b in c.bases]
+        return any(b.split(".")[-1] == "Serializer" for b in bs) and not any(b.split(".")[-1] == "ModelSerializer" for b in bs)
+
+    def _serializer_model(self, original, cname):
+        lines = ["class %s(BaseModel):" % cname]
+        n = 0
+        for st in original.body.body:
+            if not (isinstance(st, cst.SimpleStatementLine) and st.body and isinstance(st.body[0], cst.Assign)):
+                continue
+            a = st.body[0]
+            if len(a.targets) != 1 or not isinstance(a.targets[0].target, cst.Name) or not isinstance(a.value, cst.Call):
+                continue
+            fname = a.targets[0].target.value
+            fcls = (dotted(a.value.func) or "").split(".")[-1]
+            args = list(a.value.args)
+            ro = _kw(args, "read_only")
+            if ro is not None and dotted(ro) == "True":
+                continue
+            typ = DRF_FIELD_TYPES.get(fcls)
+            if typ is None:
+                self.warn(st, "serializer", "field %s.%s (%s) has no pydantic equivalent: typed as Any" % (cname, fname, fcls))
+                typ = "Any"
+            if typ == "Any":
+                self.typing.add("Any")
+            if typ.startswith("uuid."):
+                self.need_uuid = True
+            if typ.startswith("datetime."):
+                self.need_datetime = True
+            req = _kw(args, "required")
+            dflt = _kw(args, "default")
+            opts = []
+            for k, v in (("max_length", "max_length"), ("min_length", "min_length"), ("max_value", "le"), ("min_value", "ge")):
+                kv = _kw(args, k)
+                if kv is not None and typ in ("str", "int", "float"):
+                    opts.append("%s=%s" % (v, _code(kv)))
+            rhs = None
+            if dflt is not None:
+                rhs = _code(dflt)
+            elif req is not None and dotted(req) == "False":
+                self.typing.add("Optional")
+                typ = "Optional[%s]" % typ
+                rhs = "None"
+            if opts:
+                self.need_field = True
+                rhs = "Field(%s)" % ", ".join([rhs if rhs is not None else "..."] + opts)
+            lines.append("    %s: %s%s" % (fname, typ, (" = " + rhs) if rhs is not None else ""))
+            n += 1
+        if n == 0:
+            lines.append("    pass")
+        self.need_pydantic = True
+        return cst.parse_statement("\n".join(lines))
 
     def _line(self, node) -> int:
         try:
@@ -199,6 +312,10 @@ class ViewsConverter(cst.CSTTransformer):
             if mod and mod.split(".")[0] in ("models", "forms", "serializers"):
                 self.warn(original, "orm", "`%s` is Django-specific (models/forms/serializers) and is not converted" % mod)
             return updated
+        if mod in DRF_REMOVE_MODULES:
+            return cst.RemoveFromParent()
+        if mod == "rest_framework" and not isinstance(updated.names, cst.ImportStar) and all(a.name.value in DRF_REMOVE_NAMES for a in updated.names):
+            return cst.RemoveFromParent()
         if mod in ("django.http", "django.shortcuts", "django.core.exceptions", "django.views.decorators.csrf", "django.views.decorators.http", "django.views.decorators.cache", "django.views.decorators.clickjacking"):
             return cst.RemoveFromParent()
         if mod.startswith("django.db") or mod.startswith("django.contrib"):
@@ -216,11 +333,14 @@ class ViewsConverter(cst.CSTTransformer):
         self.depth -= 1
         cname = original.name.value
         bases = [dotted(b.value) or "" for b in updated.bases]
+        if self._is_plain_serializer(original):
+            self.warn(original, "serializer", "serializer %s converted to a pydantic model (validate/create/update methods are dropped)" % cname)
+            return self._serializer_model(original, cname)
         if cname in self.routes and any(b.split(".")[-1] == "TemplateView" and not b.startswith("rest_framework") for b in bases):
             conv = self._template_view(original, updated, cname)
             if conv is not None:
                 return cst.FlattenSentinel(conv)
-        plain_view = any(b.split(".")[-1] == "View" and not b.startswith("rest_framework") for b in bases)
+        plain_view = any(b.split(".")[-1] in ("View", "APIView") and not b.startswith("rest_framework.generics") for b in bases)
         if plain_view and cname in self.routes:
             funcs = []
             for st in updated.body.body:
@@ -307,6 +427,11 @@ class ViewsConverter(cst.CSTTransformer):
             dn = (dn or "").split(".")[-1]
             if dn in DROP_DECORATORS:
                 continue
+            if dn in DRF_DROP_DECORATORS:
+                continue
+            if dn in DRF_AUTH_DECORATORS:
+                self.warn(original, "auth", "@%s on %s is not converted: use a FastAPI dependency" % (dn, name))
+                continue
             if dn in ("method_decorator",):
                 self.warn(original, "auth", "@method_decorator on %s is not converted" % name)
                 continue
@@ -321,6 +446,7 @@ class ViewsConverter(cst.CSTTransformer):
             others.append(dec)
         notes: List[str] = []
         rw = DjangoRewriter(notes)
+        rw.serializers = self.serializers
         body = updated.body.visit(rw)
         if methods is None:
             seen = rw.methods_seen
@@ -381,6 +507,10 @@ class ViewsConverter(cst.CSTTransformer):
             lines.append("from fastapi.responses import %s" % ", ".join(sorted(self.responses)))
         if self.need_templates:
             lines.append("from fastapi.templating import Jinja2Templates")
+        if self.need_pydantic:
+            lines.append("from pydantic import BaseModel" + (", Field" if self.need_field else ""))
+        if self.need_datetime:
+            lines.append("import datetime")
         header = [cst.parse_statement(s) for s in lines]
         body = list(updated.body)
         idx = 0
