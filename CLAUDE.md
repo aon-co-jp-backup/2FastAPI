@@ -8,8 +8,8 @@
 - English: v0.2.0+. Converts Flask (hooks, render_template, request.files, Flask-RESTful/MethodView) and Django (View subclasses) to FastAPI. scan/auto/convert detect several projects and ask in English and Japanese where to put the result (creating folders). 36 differential tests, CI green on 3 OSes.
 
 ## 未了 / Open
-- 日本語: Django TemplateView/DRF、Flask-SQLAlchemy/marshmallow/JWTの組み合わせ、PyPI公開、Python 3.14ネイティブのlibcst(WindowsのPythonにlibcst無し→テストはWSL)。
-- English: Django TemplateView/DRF, Flask-SQLAlchemy/marshmallow/JWT combinations, PyPI publication, libcst on native Windows Python 3.14 (tests run in WSL).
+- 日本語: DRF(TemplateViewは変換対応済み)、Flask-SQLAlchemy/marshmallow/JWTの組み合わせ、PyPI公開、Python 3.14ネイティブのlibcst(WindowsのPythonにlibcst無し→テストはWSL)。
+- English: DRF (TemplateView now converted), Flask-SQLAlchemy/marshmallow/JWT combinations, PyPI publication, libcst on native Windows Python 3.14 (tests run in WSL).
 
 詳細・再開用メッセージ / details and the resume message: [`PORTING.md`](PORTING.md)
 

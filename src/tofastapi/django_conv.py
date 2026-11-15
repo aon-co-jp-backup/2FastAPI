@@ -182,6 +182,7 @@ class ViewsConverter(cst.CSTTransformer):
         self.need_uuid = False
         self.count = 0
         self.depth = 0
+        self.need_templates = False
 
     def _line(self, node) -> int:
         try:
@@ -215,6 +216,10 @@ class ViewsConverter(cst.CSTTransformer):
         self.depth -= 1
         cname = original.name.value
         bases = [dotted(b.value) or "" for b in updated.bases]
+        if cname in self.routes and any(b.split(".")[-1] == "TemplateView" and not b.startswith("rest_framework") for b in bases):
+            conv = self._template_view(original, updated, cname)
+            if conv is not None:
+                return cst.FlattenSentinel(conv)
         plain_view = any(b.split(".")[-1] == "View" and not b.startswith("rest_framework") for b in bases)
         if plain_view and cname in self.routes:
             funcs = []
@@ -243,6 +248,50 @@ class ViewsConverter(cst.CSTTransformer):
             if b.endswith(("View", "ViewSet", "APIView", "Model", "Form", "ModelForm", "Serializer")):
                 self.warn(original, "class-view", "class `%s(%s)` is not converted" % (cname, b))
         return updated
+
+    def _template_view(self, original, updated, cname):
+        tmpl = None
+        ctx = None
+        for st in updated.body.body:
+            if isinstance(st, cst.SimpleStatementLine) and st.body and isinstance(st.body[0], cst.Assign):
+                a = st.body[0]
+                if len(a.targets) == 1 and dotted(a.targets[0].target) == "template_name":
+                    tmpl = str_value(a.value)
+            elif isinstance(st, cst.FunctionDef) and st.name.value == "get_context_data":
+                ctx = st
+        if tmpl is None:
+            self.warn(original, "class-view", "TemplateView %s has no literal template_name: not converted" % cname)
+            return None
+        self.need_templates = True
+        self.fastapi.add("Request")
+        path, plist = self.routes[cname][0]
+        params = ["request: Request"] + ["%s: %s" % (n, t) for n, t in plist]
+        out = []
+        kw = ", ".join("%s=%s" % (n, n) for n, _ in plist)
+        if ctx is not None:
+            helper = ctx.with_changes(
+                name=cst.Name("_%s_context" % cname),
+                params=cst.Parameters(star_kwarg=cst.Param(name=cst.Name("kwargs"))),
+                leading_lines=[cst.EmptyLine(), cst.EmptyLine()],
+            )
+            helper = helper.visit(_SuperCtx())
+            if count_name(helper.body, "self") > 0:
+                self.warn(ctx, "class-view", "%s.get_context_data uses `self`: check the converted function" % cname)
+            out.append(helper)
+            ctxsrc = "_%s_context(%s)" % (cname, kw)
+        else:
+            ctxsrc = "{%s}" % ", ".join("%r: %s" % (n, n) for n, _ in plist)
+        fn = cst.parse_statement(
+            "@router.get(%r)\ndef %s_get(%s):\n    return templates.TemplateResponse(request, %r, %s)\n"
+            % (path, cname, ", ".join(params), tmpl, ctxsrc)
+        )
+        self.count += 1
+        for p2, _ in self.routes[cname][1:]:
+            self.warn(original, "class-view", "%s is mounted at several paths; only %s is converted" % (cname, path))
+            break
+        self.warn(original, "class-view", "TemplateView %s -> %s_get using Jinja2Templates: check Django template tags in %s" % (cname, cname, tmpl))
+        out.append(fn)
+        return out
 
     def leave_FunctionDef(self, original, updated):
         name = original.name.value
@@ -330,6 +379,8 @@ class ViewsConverter(cst.CSTTransformer):
         lines.append("from fastapi import %s" % ", ".join(sorted(self.fastapi)))
         if self.responses:
             lines.append("from fastapi.responses import %s" % ", ".join(sorted(self.responses)))
+        if self.need_templates:
+            lines.append("from fastapi.templating import Jinja2Templates")
         header = [cst.parse_statement(s) for s in lines]
         body = list(updated.body)
         idx = 0
@@ -344,7 +395,23 @@ class ViewsConverter(cst.CSTTransformer):
             if isinstance(st, cst.SimpleStatementLine) and st.body and isinstance(st.body[0], (cst.Import, cst.ImportFrom)):
                 last = i
         body.insert(last + 1, cst.parse_statement("\nrouter = APIRouter()\n") if False else cst.parse_statement("router = APIRouter()"))
+        if self.need_templates:
+            body.insert(last + 2, cst.parse_statement('templates = Jinja2Templates(directory="templates")'))
         return updated.with_changes(body=body)
+
+
+class _SuperCtx(cst.CSTTransformer):
+    """super().get_context_data(...) -> dict(kwargs)"""
+
+    def leave_Call(self, original, updated):
+        if dotted(updated.func) == "super().get_context_data" or (
+            isinstance(updated.func, cst.Attribute)
+            and updated.func.attr.value == "get_context_data"
+            and isinstance(updated.func.value, cst.Call)
+            and dotted(updated.func.value.func) == "super"
+        ):
+            return cst.parse_expression("dict(kwargs)")
+        return updated
 
 
 class _Rename(cst.CSTTransformer):
