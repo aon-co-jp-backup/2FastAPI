@@ -2,6 +2,8 @@
 
 **日本語**: DjangoやFlaskを使ったPythonプログラムを **FastAPI** へ変換するツール(`2` = `to`、`toFastAPI`)。出力は FastAPI と互換のコードで、[MFastAPI](https://github.com/aon-co-jp/MFastAPI)(FastAPI互換を保証)でもそのまま動く想定。コメントと書式は保ったまま書き換える(libcst)。
 
+**VS Code 拡張 / extension**: [2FastAPI-VSC](https://github.com/aon-co-jp/2FastAPI-VSC)
+
 **English**: Converts Python programs written with **Django or Flask** to **FastAPI** (`2` = `to`). The output is plain FastAPI code that also targets [MFastAPI](https://github.com/aon-co-jp/MFastAPI). Comments and formatting are preserved (libcst). 変換できない部分は黙って壊さず、**警告として報告**する。 / What cannot be converted is reported as a warning, never silently mis-converted.
 
 ```
