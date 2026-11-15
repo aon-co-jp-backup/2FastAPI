@@ -95,6 +95,8 @@ class BodyRewriter(cst.CSTTransformer):
         self.notes = notes  # human readable warnings for this view
         self.depth = 0
         self.need_request = False
+        self.need_templates = False
+        self.need_upload = False
 
     # ---- nested defs keep their own returns
     def visit_FunctionDef(self, node: cst.FunctionDef):
@@ -182,6 +184,25 @@ class BodyRewriter(cst.CSTTransformer):
             self.need_request = True
             rest = ", ".join(_code(a) for a in args[1:])
             return cst.parse_expression("str(request.url_for(%s%s))" % (_code(pos[0].value), (", " + rest) if rest else ""))
+        if d == "render_template" and pos and str_value(pos[0].value) is not None:
+            self.need_request = True
+            self.need_templates = True
+            entries = []
+            for a in args[1:]:
+                if a.keyword is not None:
+                    entries.append("%r: %s" % (a.keyword.value, _code(a.value)))
+                elif a.star == "**":
+                    entries.append("**%s" % _code(a.value))
+            self.notes.append("render_template -> Jinja2Templates: check url_for(...) inside the templates")
+            return cst.parse_expression("templates.TemplateResponse(request, %s, {%s})" % (_code(pos[0].value), ", ".join(entries)))
+        if d == "request.files.get" and pos and str_value(pos[0].value):
+            name = ident(str_value(pos[0].value))
+            self.fastapi |= {"File", "UploadFile"}
+            self.typing.add("Optional")
+            self.params.add(name, "Optional[UploadFile]", "File(None)")
+            self.need_upload = True
+            self.notes.append("request.files -> UploadFile wrapped in _Upload (sync read()/save()/filename, like Werkzeug FileStorage)")
+            return cst.parse_expression("_Upload(%s)" % name) if False else cst.parse_expression("(_Upload(%s) if %s is not None else None)" % (name, name))
         if d in ("render_template", "render_template_string", "make_response", "send_file", "send_from_directory", "flash", "stream_with_context"):
             self.notes.append("%s(...) is not converted automatically" % d)
         return updated
@@ -196,8 +217,16 @@ class BodyRewriter(cst.CSTTransformer):
                 if kind == "header":
                     key = key.lower().replace("-", "_")
                 return self._param(key, kind, None, None, True)
-        if d == "request.files":
-            self.notes.append("request.files[...] -> use `UploadFile = File(...)` parameters")
+        if d == "request.files" and len(updated.slice) == 1:
+            el = updated.slice[0].slice
+            key = str_value(el.value) if isinstance(el, cst.Index) else None
+            if key is not None:
+                name = ident(key)
+                self.fastapi |= {"File", "UploadFile"}
+                self.params.add(name, "UploadFile", "File(...)")
+                self.need_upload = True
+                self.notes.append("request.files -> UploadFile wrapped in _Upload (sync read()/save()/filename, like Werkzeug FileStorage)")
+                return cst.parse_expression("_Upload(%s)" % name)
         return updated
 
     def leave_Attribute(self, original, updated):
@@ -231,6 +260,8 @@ class BodyRewriter(cst.CSTTransformer):
                     detail = _code(pos[1].value)
                 elif _kw(call.args, "description") is not None:
                     detail = _code(_kw(call.args, "description"))
+                elif _kw(call.args, "message") is not None:
+                    detail = _code(_kw(call.args, "message"))
                 self.fastapi.add("HTTPException")
                 src = "raise HTTPException(status_code=%s%s)" % (code, (", detail=" + detail) if detail else "")
                 new = cst.parse_statement(src)
@@ -289,6 +320,12 @@ class FlaskConverter(cst.CSTTransformer):
         self.used_router = False
         self.routes = 0
         self.warned_config = False
+        self.hooks = []
+        self.need_templates = False
+        self.need_upload = False
+        self.classviews = {}  # name -> ClassDef (Flask-RESTful Resource / MethodView)
+        self.class_routes = {}  # name -> [(obj, rule)]
+        self.api_obj = {}  # flask_restful Api variable -> app/blueprint name
 
     def _line(self, node) -> int:
         try:
@@ -317,6 +354,8 @@ class FlaskConverter(cst.CSTTransformer):
 
     def leave_ImportFrom(self, original, updated):
         mod = dotted(updated.module) if updated.module is not None else None
+        if mod == "flask.views":
+            return cst.RemoveFromParent()
         if mod == "flask":
             if isinstance(updated.names, cst.ImportStar):
                 self.warn(original, "import-star", "`from flask import *` cannot be converted precisely")
@@ -329,6 +368,12 @@ class FlaskConverter(cst.CSTTransformer):
             return cst.RemoveFromParent()
         if mod == "flask_cors":
             self.need_cors = True
+            return cst.RemoveFromParent()
+        if mod == "flask_restful":
+            names = [a.name.value for a in updated.names] if not isinstance(updated.names, cst.ImportStar) else []
+            extra = [n for n in names if n not in ("Api", "Resource", "abort")]
+            if extra:
+                self.warn(original, "extension", "flask_restful %s: not converted (use pydantic models / Body())" % ", ".join(extra))
             return cst.RemoveFromParent()
         if mod and mod.split(".")[0] in KNOWN_EXT:
             self.warn(original, "extension", KNOWN_EXT[mod.split(".")[0]])
@@ -352,6 +397,10 @@ class FlaskConverter(cst.CSTTransformer):
                 if extra:
                     self.warn(original, "flask-app", "Flask(%s) options (templates/static) are not converted: use Jinja2Templates / app.mount('/static', StaticFiles(...))" % ", ".join(a.keyword.value for a in extra))
                 return updated.with_changes(value=cst.parse_expression("FastAPI()"))
+            if f in ("Api", "flask_restful.Api") and isinstance(updated.targets[0].target, cst.Name):
+                a0 = updated.value.args[0].value if updated.value.args else None
+                self.api_obj[updated.targets[0].target.value] = a0.value if isinstance(a0, cst.Name) else "app"
+                return cst.RemoveFromParent()
             if f in ("Blueprint", "flask.Blueprint"):
                 self.fastapi.add("APIRouter")
                 prefix = _kw(updated.value.args, "url_prefix")
@@ -377,6 +426,18 @@ class FlaskConverter(cst.CSTTransformer):
                 prefix = _kw(call.args[1:], "url_prefix")
                 new = cst.parse_statement("%s.include_router(%s%s)" % (parts[0], _code(call.args[0].value), (", prefix=" + _code(prefix)) if prefix is not None else ""))
                 return new.with_changes(leading_lines=updated.leading_lines)
+            if len(parts) == 2 and parts[1] == "add_resource" and len(call.args) >= 2 and isinstance(call.args[0].value, cst.Name):
+                target = self.api_obj.get(parts[0], parts[0])
+                for a in call.args[1:]:
+                    if a.keyword is None and str_value(a.value):
+                        self.class_routes.setdefault(call.args[0].value.value, []).append((target, str_value(a.value)))
+                return cst.RemoveFromParent()
+            if len(parts) == 2 and parts[1] == "add_url_rule" and call.args:
+                rule = str_value(call.args[0].value)
+                vf = _kw(call.args, "view_func")
+                if rule and isinstance(vf, cst.Call) and isinstance(vf.func, cst.Attribute) and vf.func.attr.value == "as_view" and isinstance(vf.func.value, cst.Name):
+                    self.class_routes.setdefault(vf.func.value.value, []).append((parts[0], rule))
+                    return cst.RemoveFromParent()
             if d == "CORS" and call.args:
                 self.need_cors = True
                 app = _code(call.args[0].value)
@@ -392,6 +453,12 @@ class FlaskConverter(cst.CSTTransformer):
         routes, others = [], []
         for dec in fn.decorators:
             c = dec.decorator
+            if isinstance(c, cst.Attribute) and isinstance(c.value, cst.Name) and (c.value.value in self.apps or c.value.value in self.routers):
+                if c.attr.value in ("before_request", "after_request"):
+                    self.hooks.append((c.value.value, c.attr.value, dec))
+                    continue
+                if c.attr.value in ("teardown_request", "context_processor", "template_filter"):
+                    self.warn(fn, "hooks", "@%s.%s is not converted (use middleware / exception handlers)" % (c.value.value, c.attr.value))
             if isinstance(c, cst.Call) and isinstance(c.func, cst.Attribute) and isinstance(c.func.value, cst.Name):
                 obj, attr = c.func.value.value, c.func.attr.value
                 if obj in self.apps or obj in self.routers:
@@ -417,15 +484,61 @@ class FlaskConverter(cst.CSTTransformer):
                             methods = [attr.upper()]
                         routes.append((obj, rule, methods))
                         continue
-                    if attr in ("before_request", "after_request", "errorhandler", "teardown_request", "context_processor", "template_filter"):
+                    if attr in ("errorhandler", "before_request", "after_request"):
+                        self.hooks.append((obj, attr, dec))
+                        continue
+                    if attr in ("teardown_request", "context_processor", "template_filter"):
                         self.warn(fn, "hooks", "@%s.%s is not converted (use middleware / exception handlers)" % (obj, attr))
             others.append(dec)
         return routes, others
 
     def leave_FunctionDef(self, original, updated):
+        self.hooks = []
         routes, others = self._routes_of(updated)
+        if self.hooks and not routes:
+            return self._convert_hook(original, updated, self.hooks, others)
         if not routes:
             return updated
+        return self._convert_view(original, updated, routes, others)
+
+    def _convert_hook(self, original, updated, hooks, others):
+        obj, attr, dec = hooks[0]
+        notes: List[str] = []
+        rw = BodyRewriter(notes)
+        body = updated.body.visit(rw)
+        body = body.visit(_PostRewriter())
+        self.fastapi.add("Request")
+        for n in notes:
+            self.warn(original, "convert", "%s: %s" % (original.name.value, n))
+        if rw.params.order:
+            self.warn(original, "hooks", "%s uses request parameters that cannot be injected into middleware: left unchanged" % original.name.value)
+            return updated
+        self.fastapi |= rw.fastapi
+        self.responses |= rw.responses
+        self.typing |= rw.typing
+        if attr == "errorhandler":
+            call = dec.decorator
+            if not call.args:
+                return updated
+            src = "%s.exception_handler(%s)" % (obj, _code(call.args[0].value))
+            first = updated.params.params[0].name.value if updated.params.params else "e"
+            params = updated.params.with_changes(params=[make_param("request", "Request", None), make_param(first, None, None)])
+            return updated.with_changes(decorators=[cst.Decorator(decorator=cst.parse_expression(src))] + others, params=params, body=body)
+        stmts = list(body.body)
+        if attr == "before_request":
+            stmts.append(cst.parse_statement("return await call_next(request)"))
+        else:
+            resp = updated.params.params[0].name.value if updated.params.params else "response"
+            stmts.insert(0, cst.parse_statement("%s = await call_next(request)" % resp))
+        params = [make_param("request", "Request", None), make_param("call_next", None, None)]
+        return updated.with_changes(
+            decorators=[cst.Decorator(decorator=cst.parse_expression('%s.middleware("http")' % obj))] + others,
+            asynchronous=cst.Asynchronous(),
+            params=updated.params.with_changes(params=params),
+            body=body.with_changes(body=stmts),
+        )
+
+    def _convert_view(self, original, updated, routes, others, drop_self=False):
         notes: List[str] = []
         rw = BodyRewriter(notes)
         body = updated.body.visit(rw)
@@ -439,7 +552,10 @@ class FlaskConverter(cst.CSTTransformer):
                 if t == "uuid.UUID":
                     self.need_uuid = True
         params = []
-        for p in updated.params.params:
+        src_params = list(updated.params.params)
+        if drop_self and src_params and src_params[0].name.value == "self":
+            src_params = src_params[1:]
+        for p in src_params:
             if p.annotation is None and p.name.value in ann and ann[p.name.value] != "str":
                 p = p.with_changes(annotation=cst.Annotation(cst.parse_expression(ann[p.name.value])))
             params.append(p)
@@ -465,6 +581,8 @@ class FlaskConverter(cst.CSTTransformer):
         self.fastapi |= rw.fastapi
         self.responses |= rw.responses
         self.typing |= rw.typing
+        self.need_templates = self.need_templates or rw.need_templates
+        self.need_upload = self.need_upload or rw.need_upload
         for n in notes:
             self.warn(original, "convert", "%s: %s" % (original.name.value, n))
         return updated.with_changes(decorators=new_decs + others, params=updated_params, body=body)
@@ -472,12 +590,45 @@ class FlaskConverter(cst.CSTTransformer):
     def leave_ClassDef(self, original, updated):
         for b in updated.bases:
             n = dotted(b.value) or ""
-            if n.endswith("MethodView") or n.endswith("Resource"):
-                self.warn(original, "class-view", "class-based view `%s` (%s) is not converted: rewrite each HTTP method as a route function" % (original.name.value, n))
+            if n.split(".")[-1] in ("MethodView", "Resource"):
+                self.classviews[original.name.value] = updated
+                return cst.RemoveFromParent()
         return updated
 
     # ---- module assembly
+    def _class_view_functions(self):
+        funcs = []
+        for cname, cdef in self.classviews.items():
+            routes = self.class_routes.get(cname)
+            if not routes:
+                self.warn(cdef, "class-view", "class %s is never registered with add_resource/add_url_rule: not converted" % cname)
+                continue
+            for st in cdef.body.body:
+                if isinstance(st, cst.FunctionDef) and st.name.value in HTTP_SHORTCUTS:
+                    rts = [(obj, rule, [st.name.value.upper()]) for obj, rule in routes]
+                    fn = st.with_changes(name=cst.Name("%s_%s" % (cname, st.name.value)), leading_lines=[cst.EmptyLine(), cst.EmptyLine()])
+                    conv = self._convert_view(st, fn, rts, [], drop_self=True)
+                    if count_name(conv.body, "self") > 0:
+                        self.warn(st, "class-view", "%s.%s uses self: check the converted function" % (cname, st.name.value))
+                    funcs.append(conv)
+        return funcs
+
     def leave_Module(self, original, updated):
+        body0 = list(updated.body)
+        extra = self._class_view_functions()
+        if extra:
+            pos_main = len(body0)
+            for i, st in enumerate(body0):
+                if isinstance(st, cst.If) and "__name__" in cst.Module([]).code_for_node(st.test):
+                    pos_main = i
+                    break
+            body0[pos_main:pos_main] = extra
+        if self.need_templates:
+            for i, st in enumerate(body0):
+                if isinstance(st, cst.SimpleStatementLine) and st.body and isinstance(st.body[0], cst.Assign) and cst.Module([]).code_for_node(st.body[0].value).startswith("FastAPI("):
+                    body0.insert(i + 1, cst.parse_statement('templates = Jinja2Templates(directory="templates")'))
+                    break
+        updated = updated.with_changes(body=body0)
         lines = []
         if self.typing:
             lines.append("from typing import %s" % ", ".join(sorted(self.typing)))
@@ -490,6 +641,8 @@ class FlaskConverter(cst.CSTTransformer):
             lines.append("from fastapi.responses import %s" % ", ".join(sorted(self.responses)))
         if self.need_cors:
             lines.append("from fastapi.middleware.cors import CORSMiddleware")
+        if self.need_templates:
+            lines.append("from fastapi.templating import Jinja2Templates")
         header = [cst.parse_statement(s) for s in lines]
         body = list(updated.body)
         idx = 0
@@ -497,7 +650,29 @@ class FlaskConverter(cst.CSTTransformer):
             idx = 1
         while idx < len(body) and isinstance(body[idx], cst.SimpleStatementLine) and body[idx].body and isinstance(body[idx].body[0], cst.ImportFrom) and dotted(body[idx].body[0].module or cst.Name("")) == "__future__":
             idx += 1
-        return updated.with_changes(body=body[:idx] + header + body[idx:])
+        helper = []
+        if self.need_upload:
+            helper = [cst.parse_statement(UPLOAD_HELPER)]
+        return updated.with_changes(body=body[:idx] + header + helper + body[idx:])
+
+
+UPLOAD_HELPER = """class _Upload:
+    \"\"\"Werkzeug FileStorage-like wrapper around Starlette's UploadFile (sync API).\"\"\"
+
+    def __init__(self, f):
+        self._f = f
+        self.filename = f.filename
+        self.content_type = f.content_type
+        self.stream = f.file
+
+    def read(self, *a):
+        return self._f.file.read(*a)
+
+    def save(self, dst):
+        import shutil
+        with open(dst, "wb") as out:
+            shutil.copyfileobj(self._f.file, out)
+"""
 
 
 def convert_source(src: str) -> Result:

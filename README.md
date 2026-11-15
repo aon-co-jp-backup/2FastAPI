@@ -27,6 +27,11 @@ uvicorn main:app --reload
 | `abort(404)`, `redirect(url)` | `HTTPException` / `RedirectResponse(status_code=302)` |
 | `Blueprint(url_prefix=)`, `register_blueprint` | `APIRouter(prefix=)`, `include_router` |
 | `flask_cors.CORS(app)` | `CORSMiddleware` |
+| `@app.before_request` / `after_request` | `@app.middleware("http")` |
+| `@app.errorhandler(404)` | `@app.exception_handler(404)` |
+| `render_template("x.html", ...)` | `Jinja2Templates.TemplateResponse` |
+| `request.files["f"]` (`.read()` `.save()` `.filename`) | `UploadFile` + 同梱の `_Upload` ラッパー / wrapper |
+| `flask_restful` `Resource` + `api.add_resource`、`MethodView` + `add_url_rule` | メソッドごとのルート関数 / one route function per method |
 
 | Django | FastAPI |
 |---|---|
@@ -39,7 +44,7 @@ uvicorn main:app --reload
 | `@csrf_exempt` 等 | 削除 / dropped |
 
 ## 変換しないもの(警告で報告) / Not converted (reported)
-ORM(Django models / Flask-SQLAlchemy)、テンプレート(`render_template` / `render`)、セッション/認証(`session`, `flask_login`, `login_required`)、クラスベースビュー(`MethodView`, `View`, DRF)、`before_request`/`after_request`/`errorhandler`、`flask.g`、各種 Flask 拡張(`flask_restful`, `flask_jwt_extended` など、手順を警告に表示)。
+ORM(Django models / Flask-SQLAlchemy)、Djangoのテンプレート(`render`)、セッション/認証(`session`, `flask_login`, `login_required`)、Djangoのクラスベースビュー/DRF、`teardown_request`、`flask.g`、各種 Flask 拡張(`flask_restful`, `flask_jwt_extended` など、手順を警告に表示)。
 
 ## 互換性の注意 / Behaviour differences (documented, tested)
 - 検証エラー: FastAPI は **422**(Flask/Django の手書き検証や型変換失敗は 400/404)。`<int:id>` に数字以外が来たとき Flask は 404、FastAPI は 422。
