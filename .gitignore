@@ -4,3 +4,7 @@ __pycache__/
 dist/
 *.egg-info/
 build/
+installer/Output/
+dist/
+build/
+*.spec

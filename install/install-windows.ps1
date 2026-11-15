@@ -5,7 +5,8 @@
 param(
     [switch]$NoOpenEasyWeb,
     [switch]$DryRun,
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    [switch]$OewOnly   # used by the .exe installer: only (re)install open-easy-web
 )
 $ErrorActionPreference = 'Stop'
 $AppDir = Join-Path $env:LOCALAPPDATA '2FastAPI'
@@ -28,6 +29,7 @@ if ($Uninstall) {
     exit 0
 }
 
+if (-not $OewOnly) {
 # 1. Python 3.9-3.13 (libcst, the conversion library, has wheels up to 3.13 / libcst の対応は 3.13 まで)
 $py = $null
 foreach ($v in '3.12', '3.13', '3.11', '3.10') {
@@ -53,6 +55,7 @@ Run 'Install 2FastAPI and libcst / 2FastAPI と libcst を導入' {
     & $vpy -m pip install --quiet --force-reinstall --no-deps $Src
 }
 
+}
 # 3. open-easy-web: install when missing (default on)
 $oewInstalled = (Test-Path (Join-Path $OewDir 'open-easy-web-server.exe')) -or [bool](Get-Command open-easy-web-server -ErrorAction SilentlyContinue)
 if ($oewInstalled) {
@@ -72,6 +75,7 @@ if ($oewInstalled) {
     }
 }
 
+if (-not $OewOnly) {
 # 4. Shortcuts with the 2FastAPI icon (GUI + Web wizard)
 Run 'Create Desktop / Start menu shortcuts / ショートカットを作成' {
     $vpyw = Join-Path $AppDir 'venv\Scripts\pythonw.exe'
@@ -85,5 +89,6 @@ Run 'Create Desktop / Start menu shortcuts / ショートカットを作成' {
         $w = $s.CreateShortcut((Join-Path $d '2FastAPI (Web).lnk')); $w.TargetPath = $vpyw; $w.Arguments = '-m tofastapi web'
         $w.IconLocation = $ico; $w.Description = '2FastAPI in the browser (this PC only)'; $w.Save()
     }
+}
 }
 Step 'Done. Double-click the 2FastAPI icon. / 完了。デスクトップの 2FastAPI アイコンをダブルクリックしてください。'
