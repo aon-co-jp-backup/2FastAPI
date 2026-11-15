@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tofastapi"
+version = "0.1.0"
+description = "2FastAPI (to FastAPI): convert Flask / Django code to FastAPI (MFastAPI compatible)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = ["libcst>=1.0"]
+
+[project.optional-dependencies]
+test = ["pytest", "flask", "django", "fastapi", "httpx", "python-multipart", "flask-cors"]
+
+[project.scripts]
+"2fastapi" = "tofastapi.cli:main"
+tofastapi = "tofastapi.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

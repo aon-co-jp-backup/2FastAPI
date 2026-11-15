@@ -1,0 +1,509 @@
+"""Flask -> FastAPI converter (libcst: comments and formatting are kept)."""
+from __future__ import annotations
+
+from typing import List, Optional, Set
+
+import libcst as cst
+from libcst.metadata import MetadataWrapper, PositionProvider
+
+from .common import (
+    ParamSet,
+    Result,
+    Warn,
+    convert_rule,
+    count_name,
+    dotted,
+    ident,
+    is_stringish,
+    make_param,
+    order_params,
+    str_value,
+)
+
+HTTP_SHORTCUTS = {"get", "post", "put", "delete", "patch", "head", "options"}
+UNSUPPORTED_NAMES = {
+    "session": "flask.session (use starlette SessionMiddleware: `app.add_middleware(SessionMiddleware, secret_key=...)` and `request.session`)",
+    "g": "flask.g (use request.state or dependencies)",
+    "flash": "flask.flash",
+    "get_flashed_messages": "flask.get_flashed_messages",
+    "current_app": "flask.current_app (use the `app` object or request.app)",
+    "make_response": "flask.make_response (return a fastapi Response)",
+    "send_file": "flask.send_file (use fastapi.responses.FileResponse)",
+    "send_from_directory": "flask.send_from_directory (use FileResponse / StaticFiles)",
+    "stream_with_context": "flask.stream_with_context (use StreamingResponse)",
+    "render_template": "flask.render_template (use fastapi.templating.Jinja2Templates: `templates.TemplateResponse(request, name, ctx)`)",
+    "render_template_string": "flask.render_template_string",
+    "Response": "flask.Response (use fastapi.Response; arguments differ: status -> status_code, mimetype -> media_type)",
+    "after_this_request": "flask.after_this_request",
+    "has_request_context": "flask.has_request_context",
+}
+KNOWN_EXT = {
+    "flask_sqlalchemy": "Flask-SQLAlchemy: not converted. Use SQLAlchemy sessions with a `Depends(get_db)` dependency.",
+    "flask_login": "Flask-Login: not converted. Use `fastapi.security` / a `Depends(current_user)` dependency.",
+    "flask_wtf": "Flask-WTF: not converted. Use pydantic models for form validation.",
+    "flask_migrate": "Flask-Migrate: use Alembic directly.",
+    "flask_restful": "Flask-RESTful: Resource classes are not converted; rewrite each method as a route.",
+    "flask_marshmallow": "Flask-Marshmallow: use pydantic models.",
+    "flask_jwt_extended": "Flask-JWT-Extended: use fastapi.security (OAuth2PasswordBearer) with PyJWT.",
+    "flask_socketio": "Flask-SocketIO: use FastAPI WebSockets or python-socketio ASGI app.",
+    "flask_caching": "Flask-Caching: use fastapi-cache2 or your own dependency.",
+    "flask_limiter": "Flask-Limiter: use slowapi.",
+    "flask_session": "Flask-Session: use starlette SessionMiddleware.",
+    "flask_babel": "Flask-Babel: not converted.",
+    "flask_mail": "Flask-Mail: use fastapi-mail.",
+    "flask_compress": "Flask-Compress: use starlette GZipMiddleware.",
+}
+
+
+def _code(node: cst.CSTNode) -> str:
+    return cst.Module([]).code_for_node(node)
+
+
+def _kw(args, name: str):
+    for a in args:
+        if a.keyword is not None and a.keyword.value == name:
+            return a.value
+    return None
+
+
+def _pos(args):
+    return [a for a in args if a.keyword is None and a.star == ""]
+
+
+def _literal_type(node: cst.CSTNode) -> Optional[str]:
+    if isinstance(node, cst.Integer):
+        return "int"
+    if isinstance(node, cst.Float):
+        return "float"
+    if isinstance(node, (cst.SimpleString, cst.FormattedString)):
+        return "str"
+    if isinstance(node, cst.Name) and node.value in ("True", "False"):
+        return "bool"
+    return None
+
+
+class BodyRewriter(cst.CSTTransformer):
+    """Rewrites the Flask request/response API inside one view function body."""
+
+    def __init__(self, notes: List[str]):
+        super().__init__()
+        self.params = ParamSet()
+        self.fastapi: Set[str] = set()
+        self.responses: Set[str] = set()
+        self.typing: Set[str] = set()
+        self.need_uuid = False
+        self.notes = notes  # human readable warnings for this view
+        self.depth = 0
+        self.need_request = False
+
+    # ---- nested defs keep their own returns
+    def visit_FunctionDef(self, node: cst.FunctionDef):
+        self.depth += 1
+
+    def leave_FunctionDef(self, original, updated):
+        self.depth -= 1
+        return updated
+
+    def visit_Lambda(self, node):
+        self.depth += 1
+
+    def leave_Lambda(self, original, updated):
+        self.depth -= 1
+        return updated
+
+    # ---- request accessors
+    def _param(self, key: str, kind: str, default_node, type_node, required: bool) -> cst.Name:
+        name = ident(key)
+        ann = _code(type_node) if type_node is not None else None
+        dflt = _code(default_node) if default_node is not None else None
+        if ann is None:
+            ann = "str"  # request values are strings unless type= is given (keeps Flask/Django semantics)
+        if kind == "query":
+            if required:
+                self.params.add(name, ann or "str", None)
+            elif dflt is None:
+                self.typing.add("Optional")
+                self.params.add(name, "Optional[%s]" % (ann or "str"), "None")
+            else:
+                self.params.add(name, ann, dflt) if ann else self.params.add(name, "str", dflt)
+        else:
+            cls = {"form": "Form", "header": "Header", "cookie": "Cookie"}[kind]
+            self.fastapi.add(cls)
+            if required:
+                self.params.add(name, ann or "str", "%s(...)" % cls)
+            elif dflt is None:
+                self.typing.add("Optional")
+                self.params.add(name, "Optional[%s]" % (ann or "str"), "%s(None)" % cls)
+            else:
+                self.params.add(name, ann or "str", "%s(%s)" % (cls, dflt))
+        return cst.Name(name)
+
+    def leave_Call(self, original, updated):
+        d = dotted(updated.func)
+        args = list(updated.args)
+        pos = _pos(args)
+        if d in ("request.args.get", "request.values.get", "request.form.get", "request.headers.get", "request.cookies.get") and pos:
+            key = str_value(pos[0].value)
+            if key is None:
+                self.notes.append("dynamic key in %s(...) was left unchanged" % d)
+                return updated
+            kind = {"args": "query", "values": "query", "form": "form", "headers": "header", "cookies": "cookie"}[d.split(".")[1]]
+            if kind == "header":
+                key = key.lower().replace("-", "_")
+            default = pos[1].value if len(pos) > 1 else _kw(args, "default")
+            return self._param(key, kind, default, _kw(args, "type"), False)
+        if d == "request.args.getlist" and pos and str_value(pos[0].value):
+            name = ident(str_value(pos[0].value))
+            self.fastapi.add("Query")
+            self.typing.add("List")
+            self.params.add(name, "List[str]", "Query(default=[])")
+            return cst.Name(name)
+        if d == "request.get_json":
+            self.fastapi.add("Body")
+            self.typing.add("Any")
+            self.params.add("payload", "Any", "Body(None)")
+            return cst.Name("payload")
+        if d == "jsonify":
+            if not args:
+                return cst.parse_expression("{}")
+            if len(args) == 1 and args[0].keyword is None and args[0].star == "":
+                return args[0].value.with_changes() if not isinstance(args[0].value, cst.Name) else args[0].value
+            if all(a.keyword is not None for a in args):
+                return updated.with_changes(func=cst.Name("dict"))
+            return cst.List([cst.Element(a.value) for a in args])
+        if d == "redirect" and pos:
+            self.responses.add("RedirectResponse")
+            code = pos[1].value if len(pos) > 1 else _kw(args, "code")
+            return cst.parse_expression("RedirectResponse(%s, status_code=%s)" % (_code(pos[0].value), _code(code) if code is not None else "302"))
+        if d == "url_for" and pos and str_value(pos[0].value):
+            if str_value(pos[0].value) == "static" or "." in str_value(pos[0].value):
+                self.notes.append("url_for('%s') (static files / blueprint endpoint) was left unchanged" % str_value(pos[0].value))
+                return updated
+            self.need_request = True
+            rest = ", ".join(_code(a) for a in args[1:])
+            return cst.parse_expression("str(request.url_for(%s%s))" % (_code(pos[0].value), (", " + rest) if rest else ""))
+        if d in ("render_template", "render_template_string", "make_response", "send_file", "send_from_directory", "flash", "stream_with_context"):
+            self.notes.append("%s(...) is not converted automatically" % d)
+        return updated
+
+    def leave_Subscript(self, original, updated):
+        d = dotted(updated.value)
+        if d in ("request.args", "request.values", "request.form", "request.headers", "request.cookies") and len(updated.slice) == 1:
+            el = updated.slice[0].slice
+            key = str_value(el.value) if isinstance(el, cst.Index) else None
+            if key is not None:
+                kind = {"args": "query", "values": "query", "form": "form", "headers": "header", "cookies": "cookie"}[d.split(".")[1]]
+                if kind == "header":
+                    key = key.lower().replace("-", "_")
+                return self._param(key, kind, None, None, True)
+        if d == "request.files":
+            self.notes.append("request.files[...] -> use `UploadFile = File(...)` parameters")
+        return updated
+
+    def leave_Attribute(self, original, updated):
+        d = dotted(updated)
+        if d == "request.json":
+            self.fastapi.add("Body")
+            self.typing.add("Any")
+            self.params.add("payload", "Any", "Body(None)")
+            return cst.Name("payload")
+        if d == "request.path":
+            return cst.parse_expression("request.url.path")
+        if d == "request.remote_addr":
+            return cst.parse_expression("request.client.host")
+        if d == "request.is_json":
+            self.notes.append("request.is_json has no equivalent (check the Content-Type header)")
+        return updated
+
+    # ---- statements / returns
+    def leave_SimpleStatementLine(self, original, updated):
+        if len(updated.body) == 1 and isinstance(updated.body[0], cst.Assign):
+            a = updated.body[0]
+            if len(a.targets) == 1 and isinstance(a.targets[0].target, cst.Name) and isinstance(a.value, cst.Name) and a.value.value == a.targets[0].target.value:
+                return cst.RemoveFromParent()  # `q = q` left over from parameter extraction
+        if len(updated.body) == 1 and isinstance(updated.body[0], cst.Expr) and isinstance(updated.body[0].value, cst.Call):
+            call = updated.body[0].value
+            if dotted(call.func) == "abort" and call.args:
+                pos = _pos(list(call.args))
+                code = _code(pos[0].value)
+                detail = None
+                if len(pos) > 1:
+                    detail = _code(pos[1].value)
+                elif _kw(call.args, "description") is not None:
+                    detail = _code(_kw(call.args, "description"))
+                self.fastapi.add("HTTPException")
+                src = "raise HTTPException(status_code=%s%s)" % (code, (", detail=" + detail) if detail else "")
+                new = cst.parse_statement(src)
+                return new.with_changes(leading_lines=updated.leading_lines)
+        return updated
+
+    def leave_Return(self, original, updated):
+        if self.depth > 0 or updated.value is None:
+            return updated
+        v, ov = updated.value, original.value
+        if isinstance(ov, cst.Tuple) and 2 <= len(ov.elements) <= 3 and isinstance(v, cst.Tuple):
+            body_o = ov.elements[0].value
+            body, status = v.elements[0].value, v.elements[1].value
+            headers = v.elements[2].value if len(v.elements) == 3 else None
+            is_json = isinstance(body_o, (cst.Dict, cst.List)) or (isinstance(body_o, cst.Call) and dotted(body_o.func) == "jsonify") or not is_stringish(body_o)
+            cls = "JSONResponse" if is_json else "HTMLResponse"
+            self.responses.add(cls)
+            extra = (", headers=%s" % _code(headers)) if headers is not None else ""
+            expr = "%s(content=%s, status_code=%s%s)" % (cls, _code(body), _code(status), extra)
+            return updated.with_changes(value=cst.parse_expression(expr))
+        if is_stringish(v):
+            self.responses.add("HTMLResponse")
+            return updated.with_changes(value=cst.parse_expression("HTMLResponse(content=%s)" % _code(v)))
+        return updated
+
+
+class _PostRewriter(cst.CSTTransformer):
+    """Second pass: bare request.args / request.cookies etc. that the first pass could not turn into parameters."""
+
+    def __init__(self):
+        super().__init__()
+        self.query_params = False
+
+    def leave_Attribute(self, original, updated):
+        if dotted(updated) == "request.args":
+            self.query_params = True
+            return cst.parse_expression("request.query_params")
+        return updated
+
+
+class FlaskConverter(cst.CSTTransformer):
+    METADATA_DEPENDENCIES = (PositionProvider,)
+
+    def __init__(self):
+        super().__init__()
+        self.warnings: List[Warn] = []
+        self.apps: Set[str] = set()
+        self.routers: Set[str] = set()
+        self.imported: Set[str] = set()
+        self.fastapi: Set[str] = {"FastAPI"}
+        self.responses: Set[str] = set()
+        self.typing: Set[str] = set()
+        self.need_uvicorn = False
+        self.need_uuid = False
+        self.need_cors = False
+        self.used_router = False
+        self.routes = 0
+        self.warned_config = False
+
+    def _line(self, node) -> int:
+        try:
+            return self.get_metadata(PositionProvider, node).start.line
+        except Exception:
+            return 0
+
+    def warn(self, node, code: str, msg: str):
+        self.warnings.append(Warn(self._line(node), code, msg))
+
+    # ---- imports
+    def visit_Module(self, node: cst.Module):
+        names_app, names_bp = set(), set()
+
+        class Scan(cst.CSTVisitor):
+            def visit_Assign(self, n: cst.Assign):
+                if isinstance(n.value, cst.Call) and len(n.targets) == 1 and isinstance(n.targets[0].target, cst.Name):
+                    f = dotted(n.value.func)
+                    if f in ("Flask", "flask.Flask"):
+                        names_app.add(n.targets[0].target.value)
+                    elif f in ("Blueprint", "flask.Blueprint"):
+                        names_bp.add(n.targets[0].target.value)
+
+        node.visit(Scan())
+        self.apps, self.routers = names_app, names_bp
+
+    def leave_ImportFrom(self, original, updated):
+        mod = dotted(updated.module) if updated.module is not None else None
+        if mod == "flask":
+            if isinstance(updated.names, cst.ImportStar):
+                self.warn(original, "import-star", "`from flask import *` cannot be converted precisely")
+            else:
+                for alias in updated.names:
+                    n = alias.name.value
+                    self.imported.add(alias.asname.name.value if alias.asname is not None else n)
+                    if n in UNSUPPORTED_NAMES:
+                        self.warn(original, "flask-api", UNSUPPORTED_NAMES[n])
+            return cst.RemoveFromParent()
+        if mod == "flask_cors":
+            self.need_cors = True
+            return cst.RemoveFromParent()
+        if mod and mod.split(".")[0] in KNOWN_EXT:
+            self.warn(original, "extension", KNOWN_EXT[mod.split(".")[0]])
+        return updated
+
+    def leave_Import(self, original, updated):
+        for alias in updated.names:
+            n = dotted(alias.name) or ""
+            if n == "flask":
+                self.warn(original, "import-flask", "`import flask` usage (flask.xxx) is not converted; use `from flask import ...` style or convert by hand")
+            elif n.split(".")[0] in KNOWN_EXT:
+                self.warn(original, "extension", KNOWN_EXT[n.split(".")[0]])
+        return updated
+
+    # ---- app objects
+    def leave_Assign(self, original, updated):
+        if isinstance(updated.value, cst.Call) and len(updated.targets) == 1:
+            f = dotted(updated.value.func)
+            if f in ("Flask", "flask.Flask"):
+                extra = [a for a in updated.value.args[1:] if a.keyword is not None and a.keyword.value in ("template_folder", "static_folder", "static_url_path", "instance_path")]
+                if extra:
+                    self.warn(original, "flask-app", "Flask(%s) options (templates/static) are not converted: use Jinja2Templates / app.mount('/static', StaticFiles(...))" % ", ".join(a.keyword.value for a in extra))
+                return updated.with_changes(value=cst.parse_expression("FastAPI()"))
+            if f in ("Blueprint", "flask.Blueprint"):
+                self.fastapi.add("APIRouter")
+                prefix = _kw(updated.value.args, "url_prefix")
+                return updated.with_changes(value=cst.parse_expression("APIRouter(%s)" % (("prefix=" + _code(prefix)) if prefix is not None else "")))
+        return updated
+
+    def leave_SimpleStatementLine(self, original, updated):
+        if len(updated.body) == 1 and isinstance(updated.body[0], cst.Expr) and isinstance(updated.body[0].value, cst.Call):
+            call = updated.body[0].value
+            d = dotted(call.func) or ""
+            parts = d.split(".")
+            if len(parts) == 2 and parts[0] in self.apps and parts[1] == "run":
+                self.need_uvicorn = True
+                kws = []
+                for a in call.args:
+                    if a.keyword is not None and a.keyword.value in ("host", "port"):
+                        kws.append("%s=%s" % (a.keyword.value, _code(a.value)))
+                    elif a.keyword is not None and a.keyword.value == "debug":
+                        self.warn(original, "debug", "app.run(debug=...) -> run `uvicorn module:app --reload` for auto-reload")
+                new = cst.parse_statement("uvicorn.run(%s%s)" % (parts[0], (", " + ", ".join(kws)) if kws else ""))
+                return new.with_changes(leading_lines=updated.leading_lines)
+            if len(parts) == 2 and parts[1] == "register_blueprint" and call.args:
+                prefix = _kw(call.args[1:], "url_prefix")
+                new = cst.parse_statement("%s.include_router(%s%s)" % (parts[0], _code(call.args[0].value), (", prefix=" + _code(prefix)) if prefix is not None else ""))
+                return new.with_changes(leading_lines=updated.leading_lines)
+            if d == "CORS" and call.args:
+                self.need_cors = True
+                app = _code(call.args[0].value)
+                new = cst.parse_statement('%s.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])' % app)
+                return new.with_changes(leading_lines=updated.leading_lines)
+            if len(parts) == 2 and parts[0] in self.apps and parts[1] in ("before_request", "after_request", "teardown_request", "errorhandler"):
+                self.warn(original, "hooks", "app.%s(...) is not converted: use middleware (`@app.middleware('http')`) / exception handlers" % parts[1])
+        return updated
+
+    # ---- routes
+    def _routes_of(self, fn: cst.FunctionDef):
+        """[(object, path, methods)], other decorators"""
+        routes, others = [], []
+        for dec in fn.decorators:
+            c = dec.decorator
+            if isinstance(c, cst.Call) and isinstance(c.func, cst.Attribute) and isinstance(c.func.value, cst.Name):
+                obj, attr = c.func.value.value, c.func.attr.value
+                if obj in self.apps or obj in self.routers:
+                    if attr == "route" or attr in HTTP_SHORTCUTS:
+                        args = list(c.args)
+                        pos = _pos(args)
+                        rule = str_value(pos[0].value) if pos else str_value(_kw(args, "rule"))
+                        if rule is None:
+                            self.warn(fn, "dynamic-route", "route rule is not a string literal: left unchanged")
+                            others.append(dec)
+                            continue
+                        if attr == "route":
+                            m = _kw(args, "methods")
+                            if m is None:
+                                methods = ["GET"]
+                            elif isinstance(m, (cst.List, cst.Tuple, cst.Set)) and all(str_value(e.value) for e in m.elements):
+                                methods = [str_value(e.value).upper() for e in m.elements]
+                            else:
+                                self.warn(fn, "dynamic-route", "`methods=` is not a literal list: left unchanged")
+                                others.append(dec)
+                                continue
+                        else:
+                            methods = [attr.upper()]
+                        routes.append((obj, rule, methods))
+                        continue
+                    if attr in ("before_request", "after_request", "errorhandler", "teardown_request", "context_processor", "template_filter"):
+                        self.warn(fn, "hooks", "@%s.%s is not converted (use middleware / exception handlers)" % (obj, attr))
+            others.append(dec)
+        return routes, others
+
+    def leave_FunctionDef(self, original, updated):
+        routes, others = self._routes_of(updated)
+        if not routes:
+            return updated
+        notes: List[str] = []
+        rw = BodyRewriter(notes)
+        body = updated.body.visit(rw)
+        post = _PostRewriter()
+        body = body.visit(post)
+        # path parameters from the rule(s)
+        ann = {}
+        for _, rule, _ in routes:
+            for n, t in convert_rule(rule)[1]:
+                ann[n] = t
+                if t == "uuid.UUID":
+                    self.need_uuid = True
+        params = []
+        for p in updated.params.params:
+            if p.annotation is None and p.name.value in ann and ann[p.name.value] != "str":
+                p = p.with_changes(annotation=cst.Annotation(cst.parse_expression(ann[p.name.value])))
+            params.append(p)
+        existing = {p.name.value for p in params}
+        for p in rw.params.params():
+            if p.name.value not in existing:
+                params.append(p)
+        if (rw.need_request or post.query_params or count_name(body, "request") > 0) and "request" not in existing:
+            self.fastapi.add("Request")
+            params.append(make_param("request", "Request", None))
+        updated_params = updated.params.with_changes(params=order_params(params))
+        # decorators
+        new_decs = []
+        for obj, rule, methods in routes:
+            path = convert_rule(rule)[0]
+            if len(methods) == 1:
+                src = "@%s.%s(%r)" % (obj, methods[0].lower(), path)
+            else:
+                src = "@%s.api_route(%r, methods=%r)" % (obj, path, methods)
+            src = src.replace("'", '"')
+            new_decs.append(cst.Decorator(decorator=cst.parse_expression(src[1:])))
+            self.routes += 1
+        self.fastapi |= rw.fastapi
+        self.responses |= rw.responses
+        self.typing |= rw.typing
+        for n in notes:
+            self.warn(original, "convert", "%s: %s" % (original.name.value, n))
+        return updated.with_changes(decorators=new_decs + others, params=updated_params, body=body)
+
+    def leave_ClassDef(self, original, updated):
+        for b in updated.bases:
+            n = dotted(b.value) or ""
+            if n.endswith("MethodView") or n.endswith("Resource"):
+                self.warn(original, "class-view", "class-based view `%s` (%s) is not converted: rewrite each HTTP method as a route function" % (original.name.value, n))
+        return updated
+
+    # ---- module assembly
+    def leave_Module(self, original, updated):
+        lines = []
+        if self.typing:
+            lines.append("from typing import %s" % ", ".join(sorted(self.typing)))
+        if self.need_uuid:
+            lines.append("import uuid")
+        if self.need_uvicorn:
+            lines.append("import uvicorn")
+        lines.append("from fastapi import %s" % ", ".join(sorted(self.fastapi)))
+        if self.responses:
+            lines.append("from fastapi.responses import %s" % ", ".join(sorted(self.responses)))
+        if self.need_cors:
+            lines.append("from fastapi.middleware.cors import CORSMiddleware")
+        header = [cst.parse_statement(s) for s in lines]
+        body = list(updated.body)
+        idx = 0
+        if body and isinstance(body[0], cst.SimpleStatementLine) and body[0].body and isinstance(body[0].body[0], cst.Expr) and isinstance(body[0].body[0].value, (cst.SimpleString, cst.ConcatenatedString)):
+            idx = 1
+        while idx < len(body) and isinstance(body[idx], cst.SimpleStatementLine) and body[idx].body and isinstance(body[idx].body[0], cst.ImportFrom) and dotted(body[idx].body[0].module or cst.Name("")) == "__future__":
+            idx += 1
+        return updated.with_changes(body=body[:idx] + header + body[idx:])
+
+
+def convert_source(src: str) -> Result:
+    module = cst.parse_module(src)
+    wrapper = MetadataWrapper(module)
+    conv = FlaskConverter()
+    new = wrapper.visit(conv)
+    # route functions that are not used in `request.xxx` leftovers etc. are reported by the converter itself
+    return Result(code=new.code, warnings=conv.warnings, routes=conv.routes)
