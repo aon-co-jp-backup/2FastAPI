@@ -189,3 +189,23 @@ CI は Ubuntu / Windows / macOS × Python 3.10・3.12・3.13。 / ライセン�
 - **Server-streaming is supported** (`open-runo-connect-*` in RPoem, main `1570371` / `34cb595`): `application/connect+json` envelopes, also via gRPC / gRPC-web; mid-stream errors end with a terminal frame; item/time limits, resource release on disconnect, and a real-TCP `WatchEvents` test pass. **Not yet deployed to the VPS.**
 - **When to use**: watching changes, progress updates, incremental results. One-shot calls stay plain Connect unary. Client-streaming / bidirectional only when needed.
 - German and Russian not yet added.
+
+## 2FastAPI - 多言語の説明 / Multilingual description (13 languages)
+
+公開ページ / Pages: https://easy-web.tokyo/2FastAPI ・ https://easy-web.tokyo/2FastAPI/demo (ダウンロード専用 / download-only)
+
+- **日本語**: FlaskとDjangoのプロジェクトをFastAPI(MFastAPI互換)へ変換するツール。VS Code拡張版は 2FastAPI-VSC。
+- **English**: A tool that converts Flask and Django projects to FastAPI (MFastAPI-compatible). The VS Code extension is 2FastAPI-VSC.
+- **中文(简体)**: 将 Flask 和 Django 项目转换为 FastAPI(兼容 MFastAPI)的工具。VS Code 扩展版为 2FastAPI-VSC。
+- **中文(台灣・繁體)**: 將 Flask 與 Django 專案轉換為 FastAPI(相容 MFastAPI)的工具。VS Code 擴充功能版為 2FastAPI-VSC。
+- **한국어**: Flask와 Django 프로젝트를 FastAPI(MFastAPI 호환)로 변환하는 도구입니다. VS Code 확장 버전은 2FastAPI-VSC입니다.
+- **Italiano**: Uno strumento che converte progetti Flask e Django in FastAPI (compatibile con MFastAPI). L'estensione per VS Code è 2FastAPI-VSC.
+- **Français**: Un outil qui convertit des projets Flask et Django en FastAPI (compatible MFastAPI). L'extension VS Code s'appelle 2FastAPI-VSC.
+- **Deutsch**: Ein Werkzeug, das Flask- und Django-Projekte in FastAPI (MFastAPI-kompatibel) umwandelt. Die VS-Code-Erweiterung heißt 2FastAPI-VSC.
+- **Русский**: Инструмент, преобразующий проекты Flask и Django в FastAPI (совместимо с MFastAPI). Расширение для VS Code называется 2FastAPI-VSC.
+- **Українська**: Інструмент, що перетворює проєкти Flask і Django на FastAPI (сумісно з MFastAPI). Розширення для VS Code називається 2FastAPI-VSC.
+- **فارسی (ایران)**: ابزاری که پروژه‌های Flask و Django را به FastAPI (سازگار با MFastAPI) تبدیل می‌کند. افزونهٔ VS Code با نام 2FastAPI-VSC موجود است.
+- **العربية**: أداة تحوّل مشاريع Flask وDjango إلى FastAPI (متوافق مع MFastAPI). إضافة VS Code اسمها 2FastAPI-VSC.
+- **עברית (ישראל)**: כלי שממיר פרויקטים של Flask ו-Django ל-FastAPI (תואם MFastAPI). תוסף VS Code נקרא 2FastAPI-VSC.
+
+Download: https://github.com/aon-co-jp/2FastAPI/releases/latest
