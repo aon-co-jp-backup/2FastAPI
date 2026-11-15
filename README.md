@@ -8,7 +8,9 @@
 pip install tofastapi           # (またはGitHub Releaseのwheel / or the wheel from the GitHub Release)
 2fastapi flask app.py -o app_fastapi.py
 2fastapi django path/to/project -o out_dir      # urls.py + views.py -> routers + main.py + CONVERSION_REPORT.md
-2fastapi auto <file-or-dir> -o out
+2fastapi scan <dir>                 # フォルダ配下の Flask / Django を自動検出 / detect projects
+2fastapi auto <dir>                 # 検出 → 変換先を英語・日本語で質問(無ければ作成) / ask where to put the result (EN/JA)
+2fastapi auto <dir> -o out --yes    # 質問なし・フォルダ自動作成 / no questions, create folders
 uvicorn main:app --reload
 ```
 
