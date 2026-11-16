@@ -97,6 +97,27 @@ class BodyRewriter(cst.CSTTransformer):
         self.need_request = False
         self.need_templates = False
         self.need_upload = False
+        self.need_session = False
+        self.flask_names: Set[str] = set()
+
+    # ---- flask.session / flask.g
+    def leave_Name(self, original, updated):
+        v = original.value
+        if v in ("session", "g") and v in self.flask_names:
+            self.need_request = True
+            if v == "session":
+                self.need_session = True
+                return cst.parse_expression("request.session")
+            return cst.parse_expression("request.state")
+        return updated
+
+    def leave_Arg(self, original, updated):
+        if original.keyword is not None and original.keyword.value in ("session", "g"):
+            return updated.with_changes(keyword=original.keyword)
+        return updated
+
+    def leave_Param(self, original, updated):
+        return updated.with_changes(name=original.name)
 
     # ---- nested defs keep their own returns
     def visit_FunctionDef(self, node: cst.FunctionDef):
@@ -238,6 +259,8 @@ class BodyRewriter(cst.CSTTransformer):
         return updated
 
     def leave_Attribute(self, original, updated):
+        if original.attr.value in ("session", "g"):
+            updated = updated.with_changes(attr=original.attr)
         d = dotted(updated)
         if d == "request.json":
             self.fastapi.add("Body")
@@ -331,6 +354,8 @@ class FlaskConverter(cst.CSTTransformer):
         self.hooks = []
         self.need_templates = False
         self.need_upload = False
+        self.need_session = False
+        self.flask_names: Set[str] = set()
         self.classviews = {}  # name -> ClassDef (Flask-RESTful Resource / MethodView)
         self.class_routes = {}  # name -> [(obj, rule)]
         self.api_obj = {}  # flask_restful Api variable -> app/blueprint name
@@ -371,7 +396,13 @@ class FlaskConverter(cst.CSTTransformer):
                 for alias in updated.names:
                     n = alias.name.value
                     self.imported.add(alias.asname.name.value if alias.asname is not None else n)
-                    if n in UNSUPPORTED_NAMES:
+                    if n in ("session", "g") and alias.asname is None:
+                        self.flask_names.add(n)
+                        if n == "session":
+                            self.warn(original, "session", "flask.session -> request.session (Starlette SessionMiddleware, secret from env SECRET_KEY: set a real one; the cookie format differs from Flask's)")
+                        else:
+                            self.warn(original, "flask-g", "flask.g -> request.state (per-request, set attributes only)")
+                    elif n in UNSUPPORTED_NAMES:
                         self.warn(original, "flask-api", UNSUPPORTED_NAMES[n])
             return cst.RemoveFromParent()
         if mod == "flask_cors":
@@ -513,6 +544,7 @@ class FlaskConverter(cst.CSTTransformer):
         obj, attr, dec = hooks[0]
         notes: List[str] = []
         rw = BodyRewriter(notes)
+        rw.flask_names = self.flask_names
         body = updated.body.visit(rw)
         body = body.visit(_PostRewriter())
         self.fastapi.add("Request")
@@ -549,6 +581,7 @@ class FlaskConverter(cst.CSTTransformer):
     def _convert_view(self, original, updated, routes, others, drop_self=False):
         notes: List[str] = []
         rw = BodyRewriter(notes)
+        rw.flask_names = self.flask_names
         body = updated.body.visit(rw)
         post = _PostRewriter()
         body = body.visit(post)
@@ -591,6 +624,7 @@ class FlaskConverter(cst.CSTTransformer):
         self.typing |= rw.typing
         self.need_templates = self.need_templates or rw.need_templates
         self.need_upload = self.need_upload or rw.need_upload
+        self.need_session = self.need_session or rw.need_session
         for n in notes:
             self.warn(original, "convert", "%s: %s" % (original.name.value, n))
         return updated.with_changes(decorators=new_decs + others, params=updated_params, body=body)
@@ -631,6 +665,12 @@ class FlaskConverter(cst.CSTTransformer):
                     pos_main = i
                     break
             body0[pos_main:pos_main] = extra
+        if self.need_session:
+            for i, st in enumerate(body0):
+                if isinstance(st, cst.SimpleStatementLine) and st.body and isinstance(st.body[0], cst.Assign) and cst.Module([]).code_for_node(st.body[0].value).startswith("FastAPI("):
+                    an = cst.Module([]).code_for_node(st.body[0].targets[0].target)
+                    body0.insert(i + 1, cst.parse_statement('%s.add_middleware(SessionMiddleware, secret_key=os.environ.get("SECRET_KEY", "change-me"))' % an))
+                    break
         if self.need_templates:
             for i, st in enumerate(body0):
                 if isinstance(st, cst.SimpleStatementLine) and st.body and isinstance(st.body[0], cst.Assign) and cst.Module([]).code_for_node(st.body[0].value).startswith("FastAPI("):
@@ -647,6 +687,9 @@ class FlaskConverter(cst.CSTTransformer):
         lines.append("from fastapi import %s" % ", ".join(sorted(self.fastapi)))
         if self.responses:
             lines.append("from fastapi.responses import %s" % ", ".join(sorted(self.responses)))
+        if self.need_session:
+            lines.append("import os")
+            lines.append("from starlette.middleware.sessions import SessionMiddleware")
         if self.need_cors:
             lines.append("from fastapi.middleware.cors import CORSMiddleware")
         if self.need_templates:
