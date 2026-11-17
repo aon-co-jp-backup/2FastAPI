@@ -355,6 +355,9 @@ class FlaskConverter(cst.CSTTransformer):
         self.need_templates = False
         self.need_upload = False
         self.need_session = False
+        self.need_sqla = False
+        self.sqla_vars = []
+        self.uses_config = False
         self.flask_names: Set[str] = set()
         self.classviews = {}  # name -> ClassDef (Flask-RESTful Resource / MethodView)
         self.class_routes = {}  # name -> [(obj, rule)]
@@ -384,6 +387,9 @@ class FlaskConverter(cst.CSTTransformer):
 
         node.visit(Scan())
         self.apps, self.routers = names_app, names_bp
+        import re as _re
+
+        self.uses_config = any(_re.search(r"\b%s\.config\b" % _re.escape(a), cst.Module([]).code_for_node(node)) for a in names_app)
 
     def leave_ImportFrom(self, original, updated):
         mod = dotted(updated.module) if updated.module is not None else None
@@ -404,6 +410,11 @@ class FlaskConverter(cst.CSTTransformer):
                             self.warn(original, "flask-g", "flask.g -> request.state (per-request, set attributes only)")
                     elif n in UNSUPPORTED_NAMES:
                         self.warn(original, "flask-api", UNSUPPORTED_NAMES[n])
+            return cst.RemoveFromParent()
+        if mod == "flask_sqlalchemy":
+            self.need_sqla = True
+            self.fastapi.add("HTTPException")
+            self.warn(original, "flask-sqlalchemy", "Flask-SQLAlchemy -> a small SQLAlchemy shim (_SQLAlchemy: db.Model/db.session/Model.query/create_all, session scoped per request). Set SQLALCHEMY_DATABASE_URI in app.config or env DATABASE_URL")
             return cst.RemoveFromParent()
         if mod == "flask_cors":
             self.need_cors = True
@@ -436,6 +447,13 @@ class FlaskConverter(cst.CSTTransformer):
                 if extra:
                     self.warn(original, "flask-app", "Flask(%s) options (templates/static) are not converted: use Jinja2Templates / app.mount('/static', StaticFiles(...))" % ", ".join(a.keyword.value for a in extra))
                 return updated.with_changes(value=cst.parse_expression("FastAPI()"))
+            if f in ("SQLAlchemy", "flask_sqlalchemy.SQLAlchemy") and isinstance(updated.targets[0].target, cst.Name):
+                self.need_sqla = True
+                self.fastapi.add("HTTPException")
+                var = updated.targets[0].target.value
+                self.sqla_vars.append(var)
+                first = sorted(self.apps)[0] if self.apps else "None"
+                return updated.with_changes(value=cst.parse_expression("_SQLAlchemy(%s)" % first))
             if f in ("Api", "flask_restful.Api") and isinstance(updated.targets[0].target, cst.Name):
                 a0 = updated.value.args[0].value if updated.value.args else None
                 self.api_obj[updated.targets[0].target.value] = a0.value if isinstance(a0, cst.Name) else "app"
@@ -461,6 +479,8 @@ class FlaskConverter(cst.CSTTransformer):
                         self.warn(original, "debug", "app.run(debug=...) -> run `uvicorn module:app --reload` for auto-reload")
                 new = cst.parse_statement("uvicorn.run(%s%s)" % (parts[0], (", " + ", ".join(kws)) if kws else ""))
                 return new.with_changes(leading_lines=updated.leading_lines)
+            if len(parts) == 2 and parts[1] == "init_app" and parts[0] in self.sqla_vars:
+                return cst.RemoveFromParent()
             if len(parts) == 2 and parts[1] == "register_blueprint" and call.args:
                 prefix = _kw(call.args[1:], "url_prefix")
                 new = cst.parse_statement("%s.include_router(%s%s)" % (parts[0], _code(call.args[0].value), (", prefix=" + _code(prefix)) if prefix is not None else ""))
@@ -484,6 +504,14 @@ class FlaskConverter(cst.CSTTransformer):
                 return new.with_changes(leading_lines=updated.leading_lines)
             if len(parts) == 2 and parts[0] in self.apps and parts[1] in ("before_request", "after_request", "errorhandler"):
                 self.warn(original, "hooks", "app.%s(...) is not converted: use middleware (`@app.middleware('http')`) / exception handlers" % parts[1])
+        return updated
+
+    def leave_With(self, original, updated):
+        if len(updated.items) == 1 and isinstance(updated.items[0].item, cst.Call):
+            d = dotted(updated.items[0].item.func) or ""
+            if d.endswith(".app_context") or d.endswith(".test_request_context"):
+                if isinstance(updated.body, cst.IndentedBlock):
+                    return cst.FlattenSentinel(list(updated.body.body))
         return updated
 
     # ---- routes
@@ -679,11 +707,32 @@ class FlaskConverter(cst.CSTTransformer):
                     pos_main = i
                     break
             body0[pos_main:pos_main] = extra
-        if self.need_session:
+        code_of = cst.Module([]).code_for_node
+
+        def _after_app(stmts, pos_after=0):
             for i, st in enumerate(body0):
-                if isinstance(st, cst.SimpleStatementLine) and st.body and isinstance(st.body[0], cst.Assign) and cst.Module([]).code_for_node(st.body[0].value).startswith("FastAPI("):
-                    an = cst.Module([]).code_for_node(st.body[0].targets[0].target)
-                    body0.insert(i + 1, cst.parse_statement('%s.add_middleware(SessionMiddleware, secret_key=os.environ.get("SECRET_KEY", "change-me"))' % an))
+                if isinstance(st, cst.SimpleStatementLine) and st.body and isinstance(st.body[0], cst.Assign) and code_of(st.body[0].value).startswith("FastAPI("):
+                    return i, code_of(st.body[0].targets[0].target)
+            return None, None
+
+        app_i, app_name = _after_app(body0)
+        if self.uses_config and app_i is not None:
+            body0.insert(app_i + 1, cst.parse_statement("%s.config = {}" % app_name))
+        if self.need_session:
+            # the secret key is usually assigned after FastAPI(); add the middleware after the last such statement
+            at, secret = app_i, 'os.environ.get("SECRET_KEY", "change-me")'
+            for i, st in enumerate(body0):
+                if isinstance(st, cst.SimpleStatementLine) and st.body and isinstance(st.body[0], cst.Assign):
+                    tgt = code_of(st.body[0].targets[0].target)
+                    if app_name and tgt in ("%s.secret_key" % app_name, '%s.config["SECRET_KEY"]' % app_name, "%s.config['SECRET_KEY']" % app_name):
+                        at, secret = i, "%s" % tgt
+            if at is not None:
+                body0.insert(at + 1, cst.parse_statement("%s.add_middleware(SessionMiddleware, secret_key=%s)" % (app_name, secret)))
+        if self.need_sqla and app_name:
+            for i, st in enumerate(body0):
+                if isinstance(st, cst.SimpleStatementLine) and st.body and isinstance(st.body[0], cst.Assign) and code_of(st.body[0].value).startswith("_SQLAlchemy("):
+                    v = code_of(st.body[0].targets[0].target)
+                    body0.insert(i + 1, cst.parse_statement(SQLA_MIDDLEWARE % {"app": app_name, "db": v}))
                     break
         if self.need_templates:
             for i, st in enumerate(body0):
@@ -718,7 +767,109 @@ class FlaskConverter(cst.CSTTransformer):
         helper = []
         if self.need_upload:
             helper = [cst.parse_statement(UPLOAD_HELPER)]
+        if self.need_sqla:
+            helper += list(cst.parse_module(SQLA_HELPER).body)
         return updated.with_changes(body=body[:idx] + header + helper + body[idx:])
+
+
+SQLA_MIDDLEWARE = """@%(app)s.middleware("http")
+async def _sqla_scope(request, call_next):
+    token = _REQ_ID.set(next(_REQ_COUNTER))
+    try:
+        return await call_next(request)
+    finally:
+        %(db)s.session.remove()
+        _REQ_ID.reset(token)
+"""
+
+SQLA_HELPER = """import contextvars as _cv
+import itertools as _it
+import re as _re
+
+import sqlalchemy as _sa
+from sqlalchemy import orm as _orm
+
+_REQ_ID = _cv.ContextVar("_req_id", default=0)
+_REQ_COUNTER = _it.count(1)
+
+
+class _BaseQuery(_orm.Query):
+    def get_or_404(self, ident):
+        rv = self.get(ident)
+        if rv is None:
+            raise HTTPException(status_code=404)
+        return rv
+
+    def first_or_404(self):
+        rv = self.first()
+        if rv is None:
+            raise HTTPException(status_code=404)
+        return rv
+
+
+class _QueryProp:
+    def __get__(self, obj, cls):
+        return _SQLAlchemy._current.session.query(cls)
+
+
+class _SQLAlchemy:
+    \"\"\"Minimal stand-in for Flask-SQLAlchemy (db.Model, db.session, Model.query, create_all).\"\"\"
+
+    _current = None
+
+    def __init__(self, app=None):
+        import os as _os
+
+        _SQLAlchemy._current = self
+        self._app = app
+        self._engine = None
+        outer = self
+
+        class _Session(_orm.Session):
+            def get_bind(self, mapper=None, clause=None, **kw):
+                return outer.engine
+
+        def _tablename(cls):
+            return _re.sub(r"(?<!^)(?=[A-Z])", "_", cls.__name__).lower()
+
+        base = _orm.declarative_base()
+        base.query = _QueryProp()
+        base.__tablename__ = _orm.declared_attr(_tablename)
+        self.Model = base
+        self.session = _orm.scoped_session(_orm.sessionmaker(class_=_Session, query_cls=_BaseQuery), scopefunc=_REQ_ID.get)
+        self._os = _os
+
+    @property
+    def engine(self):
+        if self._engine is None:
+            cfg = getattr(self._app, "config", None) or {}
+            url = cfg.get("SQLALCHEMY_DATABASE_URI") or self._os.environ.get("DATABASE_URL") or "sqlite:///app.db"
+            kw = {}
+            if url.startswith("sqlite"):
+                kw["connect_args"] = {"check_same_thread": False}
+                if url in ("sqlite://", "sqlite:///:memory:"):
+                    kw["poolclass"] = _sa.pool.StaticPool
+            self._engine = _sa.create_engine(url, **kw)
+        return self._engine
+
+    def create_all(self):
+        self.Model.metadata.create_all(self.engine)
+
+    def drop_all(self):
+        self.Model.metadata.drop_all(self.engine)
+
+    def get_or_404(self, model, ident):
+        rv = self.session.get(model, ident)
+        if rv is None:
+            raise HTTPException(status_code=404)
+        return rv
+
+    def __getattr__(self, name):
+        for mod in (_sa, _orm):
+            if hasattr(mod, name):
+                return getattr(mod, name)
+        raise AttributeError(name)
+"""
 
 
 UPLOAD_HELPER = """class _Upload:

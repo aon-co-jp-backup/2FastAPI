@@ -12,7 +12,7 @@ license = { text = "MIT" }
 dependencies = ["libcst>=1.0"]
 
 [project.optional-dependencies]
-test = ["pytest", "flask", "django", "fastapi", "httpx", "python-multipart", "flask-cors", "flask-restful", "jinja2", "uvicorn", "djangorestframework"]
+test = ["pytest", "flask", "django", "fastapi", "httpx", "python-multipart", "flask-cors", "flask-restful", "jinja2", "uvicorn", "djangorestframework", "flask-sqlalchemy", "flask-login", "itsdangerous"]
 
 [project.scripts]
 "2fastapi" = "tofastapi.cli:main"
