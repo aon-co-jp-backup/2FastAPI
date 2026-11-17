@@ -356,6 +356,8 @@ class FlaskConverter(cst.CSTTransformer):
         self.need_upload = False
         self.need_session = False
         self.need_sqla = False
+        self.need_login = False
+        self.login_vars = []
         self.sqla_vars = []
         self.uses_config = False
         self.flask_names: Set[str] = set()
@@ -416,6 +418,13 @@ class FlaskConverter(cst.CSTTransformer):
             self.fastapi.add("HTTPException")
             self.warn(original, "flask-sqlalchemy", "Flask-SQLAlchemy -> a small SQLAlchemy shim (_SQLAlchemy: db.Model/db.session/Model.query/create_all, session scoped per request). Set SQLALCHEMY_DATABASE_URI in app.config or env DATABASE_URL")
             return cst.RemoveFromParent()
+        if mod == "flask_login":
+            self.need_login = True
+            self.need_session = True
+            self.responses.add("RedirectResponse")
+            self.fastapi.add("HTTPException")
+            self.warn(original, "flask-login", "Flask-Login -> a small session based shim (LoginManager/UserMixin/login_user/logout_user/current_user/login_required on request.session). Set a real SECRET_KEY; `fresh_login_required`, remember-me cookies and `login_manager.request_loader` are not supported")
+            return cst.RemoveFromParent()
         if mod == "flask_cors":
             self.need_cors = True
             return cst.RemoveFromParent()
@@ -447,6 +456,10 @@ class FlaskConverter(cst.CSTTransformer):
                 if extra:
                     self.warn(original, "flask-app", "Flask(%s) options (templates/static) are not converted: use Jinja2Templates / app.mount('/static', StaticFiles(...))" % ", ".join(a.keyword.value for a in extra))
                 return updated.with_changes(value=cst.parse_expression("FastAPI()"))
+            if f in ("LoginManager", "flask_login.LoginManager") and isinstance(updated.targets[0].target, cst.Name):
+                self.need_login = True
+                self.login_vars.append(updated.targets[0].target.value)
+                return updated.with_changes(value=cst.parse_expression("_LoginManager()"))
             if f in ("SQLAlchemy", "flask_sqlalchemy.SQLAlchemy") and isinstance(updated.targets[0].target, cst.Name):
                 self.need_sqla = True
                 self.fastapi.add("HTTPException")
@@ -479,7 +492,7 @@ class FlaskConverter(cst.CSTTransformer):
                         self.warn(original, "debug", "app.run(debug=...) -> run `uvicorn module:app --reload` for auto-reload")
                 new = cst.parse_statement("uvicorn.run(%s%s)" % (parts[0], (", " + ", ".join(kws)) if kws else ""))
                 return new.with_changes(leading_lines=updated.leading_lines)
-            if len(parts) == 2 and parts[1] == "init_app" and parts[0] in self.sqla_vars:
+            if len(parts) == 2 and parts[1] == "init_app" and (parts[0] in self.sqla_vars or parts[0] in self.login_vars):
                 return cst.RemoveFromParent()
             if len(parts) == 2 and parts[1] == "register_blueprint" and call.args:
                 prefix = _kw(call.args[1:], "url_prefix")
@@ -728,6 +741,8 @@ class FlaskConverter(cst.CSTTransformer):
                         at, secret = i, "%s" % tgt
             if at is not None:
                 body0.insert(at + 1, cst.parse_statement("%s.add_middleware(SessionMiddleware, secret_key=%s)" % (app_name, secret)))
+        if self.need_login and app_name and app_i is not None:
+            body0.insert(app_i + 1, cst.parse_statement(LOGIN_MIDDLEWARE % {"app": app_name}))
         if self.need_sqla and app_name:
             for i, st in enumerate(body0):
                 if isinstance(st, cst.SimpleStatementLine) and st.body and isinstance(st.body[0], cst.Assign) and code_of(st.body[0].value).startswith("_SQLAlchemy("):
@@ -769,7 +784,125 @@ class FlaskConverter(cst.CSTTransformer):
             helper = [cst.parse_statement(UPLOAD_HELPER)]
         if self.need_sqla:
             helper += list(cst.parse_module(SQLA_HELPER).body)
+        if self.need_login:
+            helper += list(cst.parse_module(LOGIN_HELPER).body)
         return updated.with_changes(body=body[:idx] + header + helper + body[idx:])
+
+
+LOGIN_MIDDLEWARE = """@%(app)s.middleware("http")
+async def _login_ctx(request, call_next):
+    token = _LOGIN_REQ.set(request)
+    try:
+        return await call_next(request)
+    finally:
+        _LOGIN_REQ.reset(token)
+"""
+
+LOGIN_HELPER = """import contextvars as _lcv
+import functools as _ft
+import inspect as _insp
+import urllib.parse as _up
+
+_LOGIN_REQ = _lcv.ContextVar("_login_req", default=None)
+_LM = None
+
+
+class UserMixin:
+    is_active = True
+    is_anonymous = False
+
+    @property
+    def is_authenticated(self):
+        return True
+
+    def get_id(self):
+        return str(self.id)
+
+
+class _Anonymous:
+    is_authenticated = False
+    is_active = False
+    is_anonymous = True
+
+    def get_id(self):
+        return None
+
+
+class _LoginManager:
+    login_view = None
+    user_callback = None
+
+    def __init__(self, app=None):
+        global _LM
+        _LM = self
+
+    def init_app(self, app):
+        return None
+
+    def user_loader(self, f):
+        self.user_callback = f
+        return f
+
+
+def _login_session():
+    req = _LOGIN_REQ.get()
+    return req.session if req is not None else {}
+
+
+def login_user(user, remember=False, **kw):
+    _login_session()["_user_id"] = user.get_id()
+    return True
+
+
+def logout_user():
+    _login_session().pop("_user_id", None)
+    return True
+
+
+class _CurrentUser:
+    def _get(self):
+        uid = _login_session().get("_user_id")
+        if uid is None or _LM is None or _LM.user_callback is None:
+            return _Anonymous()
+        return _LM.user_callback(uid) or _Anonymous()
+
+    def __getattr__(self, name):
+        return getattr(self._get(), name)
+
+    def __bool__(self):
+        return True
+
+
+current_user = _CurrentUser()
+
+
+def _unauthorized():
+    req = _LOGIN_REQ.get()
+    view = _LM.login_view if _LM is not None else None
+    if view and req is not None:
+        target = req.url_for(view).path + "?next=" + _up.quote(req.url.path, safe="")
+        return RedirectResponse(target, status_code=302)
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def login_required(func):
+    if _insp.iscoroutinefunction(func):
+        @_ft.wraps(func)
+        async def awrapper(*a, **k):
+            if not current_user.is_authenticated:
+                return _unauthorized()
+            return await func(*a, **k)
+
+        return awrapper
+
+    @_ft.wraps(func)
+    def wrapper(*a, **k):
+        if not current_user.is_authenticated:
+            return _unauthorized()
+        return func(*a, **k)
+
+    return wrapper
+"""
 
 
 SQLA_MIDDLEWARE = """@%(app)s.middleware("http")
