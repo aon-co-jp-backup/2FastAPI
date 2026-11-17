@@ -46,11 +46,22 @@ uvicorn main:app --reload
 | `raise Http404 / PermissionDenied` | `HTTPException` |
 | `@require_GET/POST/http_methods`, `request.method == "POST"` | ルートの HTTP メソッド / route methods |
 | `@csrf_exempt` 等 | 削除 / dropped |
+| `@app.teardown_request` / `teardown_appcontext` | ミドルウェアの `finally` / middleware `finally` block |
+| `@app.before_first_request` | `@app.on_event("startup")` |
+| Flask-SQLAlchemy (`db.Model`, `db.session`, `Model.query`, `create_all`, `get_or_404`) | 小さなSQLAlchemy互換層(リクエスト単位のセッション) / a small SQLAlchemy shim (per-request session) |
+| Flask-Login (`LoginManager`, `UserMixin`, `login_user`, `logout_user`, `current_user`, `login_required`) | `request.session` ベースの互換層 / a session based shim |
+| `app.config[...]` / `with app.app_context():` | `app.config = {}` / 本体を展開 / body inlined |
 | Flask `session` / `g` | `request.session` (SessionMiddleware, secret from env `SECRET_KEY`, needs `itsdangerous`) / `request.state` |
 | `View` サブクラス + `as_view()` (`get`/`post`/`put`/`patch`/`delete`) | メソッドごとのルート関数 `Class_get` ... / one route function per method |
 
 ## 変換しないもの(警告で報告) / Not converted (reported)
-ORM(Django models / Flask-SQLAlchemy)、Djangoのテンプレート(`render`)、認証(`flask_login`, `login_required`)、Django の `View` 以外のクラスベースビュー(`TemplateView` 等)・DRF、`teardown_request`、各種 Flask 拡張(`flask_restful`, `flask_jwt_extended` など、手順を警告に表示)。
+ORM(Django models / Flask-SQLAlchemy)、Djangoのテンプレート(`render`)、Django の `View` 以外のクラスベースビュー(`TemplateView` 等)・DRF、各種 Flask 拡張(`flask_restful`, `flask_jwt_extended` など、手順を警告に表示)。
+
+## バージョン / Versions (2026-11-17)
+- **変換前(Flask/Django)のバージョンは自動判定**: `requirements*.txt` / `pyproject.toml` / `setup.py` / `Pipfile` のピン、無ければコード内の特徴(`before_first_request`、`django.conf.urls.url` など)、最後に実行環境の版。結果は `CONVERSION_REPORT.md` と `convert --json` の `detected` に出ます。
+- **変換後のFastAPIのバージョンは指定可能**: `--fastapi-version 0.100.0`(VS Code拡張は設定 `tofastapi.fastapiVersion`)。指定なしは最新。古い版を指定すると `TemplateResponse(name, {"request": request, ...})` の旧形式になり、`requirements.txt` に `fastapi==指定版` を書き出します。
+- **Source (Flask/Django) versions are detected automatically** from pins in requirements/pyproject/setup/Pipfile, then code patterns, then the installed version; shown in `CONVERSION_REPORT.md` and in `convert --json` (`detected`).
+- **Target FastAPI version is selectable**: `--fastapi-version 0.100.0` (VS Code setting `tofastapi.fastapiVersion`); default = latest. Older targets get the old `TemplateResponse(name, {"request": request, ...})` form and a pinned `requirements.txt`.
 
 ## 互換性の注意 / Behaviour differences (documented, tested)
 - 検証エラー: FastAPI は **422**(Flask/Django の手書き検証や型変換失敗は 400/404)。`<int:id>` に数字以外が来たとき Flask は 404、FastAPI は 422。
