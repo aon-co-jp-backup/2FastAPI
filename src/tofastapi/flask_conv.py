@@ -482,7 +482,7 @@ class FlaskConverter(cst.CSTTransformer):
                 app = _code(call.args[0].value)
                 new = cst.parse_statement('%s.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])' % app)
                 return new.with_changes(leading_lines=updated.leading_lines)
-            if len(parts) == 2 and parts[0] in self.apps and parts[1] in ("before_request", "after_request", "teardown_request", "errorhandler"):
+            if len(parts) == 2 and parts[0] in self.apps and parts[1] in ("before_request", "after_request", "errorhandler"):
                 self.warn(original, "hooks", "app.%s(...) is not converted: use middleware (`@app.middleware('http')`) / exception handlers" % parts[1])
         return updated
 
@@ -493,10 +493,10 @@ class FlaskConverter(cst.CSTTransformer):
         for dec in fn.decorators:
             c = dec.decorator
             if isinstance(c, cst.Attribute) and isinstance(c.value, cst.Name) and (c.value.value in self.apps or c.value.value in self.routers):
-                if c.attr.value in ("before_request", "after_request"):
+                if c.attr.value in ("before_request", "after_request", "teardown_request", "teardown_appcontext", "before_first_request"):
                     self.hooks.append((c.value.value, c.attr.value, dec))
                     continue
-                if c.attr.value in ("teardown_request", "context_processor", "template_filter"):
+                if c.attr.value in ("context_processor", "template_filter"):
                     self.warn(fn, "hooks", "@%s.%s is not converted (use middleware / exception handlers)" % (c.value.value, c.attr.value))
             if isinstance(c, cst.Call) and isinstance(c.func, cst.Attribute) and isinstance(c.func.value, cst.Name):
                 obj, attr = c.func.value.value, c.func.attr.value
@@ -523,10 +523,10 @@ class FlaskConverter(cst.CSTTransformer):
                             methods = [attr.upper()]
                         routes.append((obj, rule, methods))
                         continue
-                    if attr in ("errorhandler", "before_request", "after_request"):
+                    if attr in ("errorhandler", "before_request", "after_request", "teardown_request", "teardown_appcontext", "before_first_request"):
                         self.hooks.append((obj, attr, dec))
                         continue
-                    if attr in ("teardown_request", "context_processor", "template_filter"):
+                    if attr in ("context_processor", "template_filter"):
                         self.warn(fn, "hooks", "@%s.%s is not converted (use middleware / exception handlers)" % (obj, attr))
             others.append(dec)
         return routes, others
@@ -564,6 +564,20 @@ class FlaskConverter(cst.CSTTransformer):
             first = updated.params.params[0].name.value if updated.params.params else "e"
             params = updated.params.with_changes(params=[make_param("request", "Request", None), make_param(first, None, None)])
             return updated.with_changes(decorators=[cst.Decorator(decorator=cst.parse_expression(src))] + others, params=params, body=body)
+        if attr == "before_first_request":
+            return updated.with_changes(decorators=[cst.Decorator(decorator=cst.parse_expression('%s.on_event("startup")' % obj))] + others, body=body)
+        if attr in ("teardown_request", "teardown_appcontext"):
+            exc = updated.params.params[0].name.value if updated.params.params else None
+            tr = cst.parse_statement("try:\n    return await call_next(request)\nfinally:\n    pass\n")
+            tr = tr.with_changes(finalbody=cst.Finally(body=body))
+            pre = [cst.parse_statement("%s = None" % exc)] if exc else []
+            params = [make_param("request", "Request", None), make_param("call_next", None, None)]
+            return updated.with_changes(
+                decorators=[cst.Decorator(decorator=cst.parse_expression('%s.middleware("http")' % obj))] + others,
+                asynchronous=cst.Asynchronous(),
+                params=updated.params.with_changes(params=params),
+                body=cst.IndentedBlock(body=pre + [tr]),
+            )
         stmts = list(body.body)
         if attr == "before_request":
             stmts.append(cst.parse_statement("return await call_next(request)"))

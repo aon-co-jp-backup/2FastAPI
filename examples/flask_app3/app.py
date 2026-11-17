@@ -20,3 +20,16 @@ def count():
     session["n"] = session.get("n", 0) + 1
     g.tag = "t"
     return {"n": session["n"], "tag": g.tag}
+
+
+CLOSED = []
+
+
+@app.teardown_request
+def _done(exc):
+    CLOSED.append(1)
+
+
+@app.route("/closed")
+def closed():
+    return {"closed": len(CLOSED)}

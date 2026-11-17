@@ -17,3 +17,14 @@ def test_session_and_g():
         out = [r.get_json() if hasattr(r, "get_json") else r.json() for r in seq]
         assert out == [{"user": "anonymous"}, {"ok": True}, {"user": "zed"}, {"n": 1, "tag": "t"}, {"n": 2, "tag": "t"}], out
     assert any("session" in str(w) for w in res.warnings)
+
+
+def test_teardown_request():
+    fl = load(APP, "orig_flask_app3b").app.test_client()
+    res, mod = convert_and_load(APP)
+    fa = TestClient(mod.app)
+    for c, get in ((fl, lambda r: r.get_json()), (fa, lambda r: r.json())):
+        c.get("/whoami")
+        c.get("/whoami")
+        # teardown runs after each request, so the third request sees the two earlier ones (+ itself not yet)
+        assert get(c.get("/closed")) == {"closed": 2}
