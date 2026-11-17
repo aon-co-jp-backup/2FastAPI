@@ -35,11 +35,13 @@ def main(argv=None) -> int:
     a.add_argument("-o", "--output", help="destination root (default: <path>-fastapi)")
     a.add_argument("-y", "--yes", action="store_true", help="no questions: convert everything, create folders")
     a.add_argument("--select", help="comma-separated project numbers (skip the question)")
+    a.add_argument("--fastapi-version", default=None, help="FastAPI version to generate for (default: latest)")
     c = sub.add_parser("convert", help="convert one scanned project")
     c.add_argument("--kind", required=True, choices=["flask", "django"])
     c.add_argument("--path", required=True)
     c.add_argument("-o", "--output", required=True)
     c.add_argument("--json", action="store_true")
+    c.add_argument("--fastapi-version", default=None, help="FastAPI version to generate for (default: latest). The source Flask/Django version is detected automatically.")
     c.add_argument("--target", choices=["fastapi", "mfastapi"], default="fastapi", help="mfastapi also writes run_mfastapi.py and requirements.txt")
     w = sub.add_parser("web", help="open the browser wizard (served on this PC only)")
     w.add_argument("--no-browser", action="store_true")
@@ -82,9 +84,9 @@ def main(argv=None) -> int:
                 p.files = [os.path.relpath(os.path.join(dp, fn), p.path) for dp, _, fns in os.walk(p.path) for fn in fns if fn.endswith(".py")]
                 p.entry = p.files[0] if p.files else ""
             projects = [p]
-        routes, warns = convert_project_to(projects[0], ns.output, ns.target)
+        routes, warns = convert_project_to(projects[0], ns.output, ns.target, ns.fastapi_version)
         if ns.json:
-            print(json.dumps({"routes": routes, "warnings": warns, "dest": os.path.abspath(ns.output)}, ensure_ascii=False))
+            print(json.dumps({"routes": routes, "warnings": warns, "dest": os.path.abspath(ns.output), "detected": projects[0].detected, "fastapi_version": ns.fastapi_version or "latest"}, ensure_ascii=False))
         else:
             print("wrote %s (%d routes)" % (ns.output, routes), file=sys.stderr)
             for w in warns:
@@ -93,7 +95,7 @@ def main(argv=None) -> int:
     if cmd == "auto" and os.path.isdir(ns.path):
         from .scan import run_auto
 
-        run_auto(ns.path, ns.output, assume_yes=ns.yes, select=ns.select)
+        run_auto(ns.path, ns.output, assume_yes=ns.yes, select=ns.select, fastapi_version=ns.fastapi_version)
         return 0
     if cmd == "auto":
         cmd = "flask"

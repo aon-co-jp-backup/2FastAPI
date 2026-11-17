@@ -31,6 +31,7 @@ class Project:
     files: List[str] = field(default_factory=list)  # flask: modules that import flask (relative to path)
     routes: int = 0
     notes: List[str] = field(default_factory=list)
+    detected: Dict = field(default_factory=dict)  # source versions found by versions.detect_source
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -131,15 +132,53 @@ def _count_routes_django(d: str) -> int:
 
 # ---------------------------------------------------------------- conversion
 
-def convert_project_to(p: Project, out_dir: str, target: str = "fastapi"):
+def convert_project_to(p: Project, out_dir: str, target: str = "fastapi", fastapi_version: Optional[str] = None):
     """Convert one scanned project into `out_dir` (created if needed). Returns (routes, warnings).
 
+    The source Flask/Django versions are detected automatically (p.detected, shown in CONVERSION_REPORT.md).
+    `fastapi_version` selects the FastAPI version to generate for (default: latest).
     target="mfastapi" additionally writes run_mfastapi.py (mfastapi.accelerate(app)) and requirements.txt.
     """
+    from . import versions as V
+
+    ver = V.normalize_target(fastapi_version)
     routes, warns = _convert_project_to(p, out_dir)
+    p.detected = V.detect_source(p.path, _project_sources(p))
+    code_all = []
+    for dp, _, fns in os.walk(out_dir):
+        for fn in fns:
+            if fn.endswith(".py"):
+                fp = os.path.join(dp, fn)
+                with open(fp, encoding="utf-8") as fh:
+                    src = fh.read()
+                new, notes = V.adapt_code(src, ver)
+                if new != src:
+                    with open(fp, "w", encoding="utf-8", newline="\n") as fh:
+                        fh.write(new)
+                warns += ["%s: %s" % (os.path.relpath(fp, out_dir), n) for n in notes]
+                code_all.append(new)
+    reqs = V.requirements(p.kind, ver, "\n".join(code_all))
+    with open(os.path.join(out_dir, "requirements.txt"), "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(reqs) + "\n")
+    rp = os.path.join(out_dir, "CONVERSION_REPORT.md")
+    with open(rp, "a", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n## Versions\n\n- Source (detected): %s\n- Target FastAPI: %s\n" % ("; ".join(V.describe_source(p.detected)) or "unknown", ver))
     if target == "mfastapi":
         apply_mfastapi(p, out_dir)
     return routes, warns
+
+
+def _project_sources(p: Project) -> List[str]:
+    out = []
+    if p.kind == "flask":
+        for rel in p.files:
+            out.append(_read(os.path.join(p.path, rel)))
+    else:
+        for dp, fns in _walk(p.path):
+            for fn in fns:
+                if fn in ("urls.py", "views.py", "settings.py"):
+                    out.append(_read(os.path.join(dp, fn)))
+    return out
 
 
 from .mfastapi_target import apply_mfastapi  # noqa: E402
@@ -193,6 +232,7 @@ def run_auto(
     out_root: Optional[str] = None,
     assume_yes: bool = False,
     select: Optional[str] = None,
+    fastapi_version: Optional[str] = None,
     ask: Optional[Callable[[str], str]] = None,
     say: Callable[[str], None] = print,
 ) -> List[Dict]:
@@ -244,9 +284,9 @@ def run_auto(
             if a not in ("y", "yes", "はい"):
                 say(_t("Skipped %s." % p.name, "%s をスキップしました。" % p.name))
                 continue
-        routes, warns = convert_project_to(p, dest)
+        routes, warns = convert_project_to(p, dest, fastapi_version=fastapi_version)
         say(_t("Converted %s -> %s (%d routes, %d warnings)" % (p.name, dest, routes, len(warns)), "変換しました %s -> %s (ルート %d、警告 %d)" % (p.name, dest, routes, len(warns))))
-        results.append({"name": p.name, "kind": p.kind, "source": p.path, "dest": dest, "routes": routes, "warnings": warns})
+        results.append({"name": p.name, "kind": p.kind, "source": p.path, "dest": dest, "routes": routes, "warnings": warns, "detected": p.detected})
     return results
 
 
