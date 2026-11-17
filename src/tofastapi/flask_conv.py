@@ -423,7 +423,7 @@ class FlaskConverter(cst.CSTTransformer):
             self.need_session = True
             self.responses.add("RedirectResponse")
             self.fastapi.add("HTTPException")
-            self.warn(original, "flask-login", "Flask-Login -> a small session based shim (LoginManager/UserMixin/login_user/logout_user/current_user/login_required on request.session). Set a real SECRET_KEY; `fresh_login_required`, remember-me cookies and `login_manager.request_loader` are not supported")
+            self.warn(original, "flask-login", "Flask-Login -> a small session based shim (LoginManager/UserMixin/login_user/logout_user/current_user/login_required on request.session). Set a real SECRET_KEY; `fresh_login_required` behaves like `login_required` and remember-me cookies are not issued (session only)")
             return cst.RemoveFromParent()
         if mod == "flask_cors":
             self.need_cors = True
@@ -578,6 +578,16 @@ class FlaskConverter(cst.CSTTransformer):
         if self.hooks and not routes:
             return self._convert_hook(original, updated, self.hooks, others)
         if not routes:
+            if any(isinstance(d.decorator, cst.Attribute) and isinstance(d.decorator.value, cst.Name) and d.decorator.value.value in self.login_vars
+                   and d.decorator.attr.value in ("user_loader", "request_loader", "unauthorized_handler") for d in updated.decorators):
+                notes: List[str] = []
+                rw = BodyRewriter(notes)
+                rw.flask_names = self.flask_names
+                body = updated.body.visit(rw).visit(_PostRewriter())
+                self.fastapi |= rw.fastapi
+                self.responses |= rw.responses
+                self.typing |= rw.typing
+                return updated.with_changes(body=body)
             return updated
         return self._convert_view(original, updated, routes, others)
 
@@ -843,6 +853,18 @@ class _LoginManager:
         self.user_callback = f
         return f
 
+    request_callback = None
+
+    def request_loader(self, f):
+        self.request_callback = f
+        return f
+
+    unauthorized_callback = None
+
+    def unauthorized_handler(self, f):
+        self.unauthorized_callback = f
+        return f
+
 
 def _login_session():
     req = _LOGIN_REQ.get()
@@ -851,20 +873,25 @@ def _login_session():
 
 def login_user(user, remember=False, **kw):
     _login_session()["_user_id"] = user.get_id()
+    _login_session()["_fresh"] = True
     return True
 
 
 def logout_user():
     _login_session().pop("_user_id", None)
+    _login_session().pop("_fresh", None)
     return True
 
 
 class _CurrentUser:
     def _get(self):
         uid = _login_session().get("_user_id")
-        if uid is None or _LM is None or _LM.user_callback is None:
-            return _Anonymous()
-        return _LM.user_callback(uid) or _Anonymous()
+        if uid is not None and _LM is not None and _LM.user_callback is not None:
+            return _LM.user_callback(uid) or _Anonymous()
+        req = _LOGIN_REQ.get()
+        if _LM is not None and _LM.request_callback is not None and req is not None:
+            return _LM.request_callback(req) or _Anonymous()
+        return _Anonymous()
 
     def __getattr__(self, name):
         return getattr(self._get(), name)
@@ -878,6 +905,8 @@ current_user = _CurrentUser()
 
 def _unauthorized():
     req = _LOGIN_REQ.get()
+    if _LM is not None and _LM.unauthorized_callback is not None:
+        return _LM.unauthorized_callback()
     view = _LM.login_view if _LM is not None else None
     if view and req is not None:
         target = req.url_for(view).path + "?next=" + _up.quote(req.url.path, safe="")
@@ -885,11 +914,18 @@ def _unauthorized():
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def login_required(func):
+def _guard(func, fresh):
+    def ok():
+        if not current_user.is_authenticated:
+            return False
+        if fresh and not _login_session().get("_fresh", False):
+            raise HTTPException(status_code=401, detail="Needs refresh")
+        return True
+
     if _insp.iscoroutinefunction(func):
         @_ft.wraps(func)
         async def awrapper(*a, **k):
-            if not current_user.is_authenticated:
+            if not ok():
                 return _unauthorized()
             return await func(*a, **k)
 
@@ -897,11 +933,19 @@ def login_required(func):
 
     @_ft.wraps(func)
     def wrapper(*a, **k):
-        if not current_user.is_authenticated:
+        if not ok():
             return _unauthorized()
         return func(*a, **k)
 
     return wrapper
+
+
+def login_required(func):
+    return _guard(func, False)
+
+
+def fresh_login_required(func):
+    return _guard(func, True)
 """
 
 
@@ -938,6 +982,29 @@ class _BaseQuery(_orm.Query):
         if rv is None:
             raise HTTPException(status_code=404)
         return rv
+
+
+class _Pagination:
+    def __init__(self, items, page, per_page, total):
+        self.items, self.page, self.per_page, self.total = items, page, per_page, total
+        self.pages = (total + per_page - 1) // per_page if per_page else 0
+        self.has_prev = page > 1
+        self.has_next = page < self.pages
+        self.prev_num = page - 1 if self.has_prev else None
+        self.next_num = page + 1 if self.has_next else None
+
+    def __iter__(self):
+        return iter(self.items)
+
+
+def _paginate(self, page=1, per_page=20, error_out=True, **kw):
+    page = max(int(page or 1), 1)
+    per_page = max(int(per_page or 20), 1)
+    items = self.limit(per_page).offset((page - 1) * per_page).all()
+    return _Pagination(items, page, per_page, self.order_by(None).count())
+
+
+_BaseQuery.paginate = _paginate
 
 
 class _QueryProp:
